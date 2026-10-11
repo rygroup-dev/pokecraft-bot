@@ -321,6 +321,9 @@ class TelegramUI:
             e.event(f"❌ Listing {arg} dibatalkan")
             await e.refresh()
             return "Listing dibatalkan", "market", None
+        if act == "probe":
+            ok = await e.probe_market()
+            return ("🟢 Market buka" if ok else "🔴 Market masih ditutup server"), "market", None
         if act == "claim":
             ok, msg = await e.claim_invite(arg)
             return msg, "invite", None
@@ -398,6 +401,8 @@ class TelegramUI:
             f"├ 🎲 Roll {num(d['rolls'])} · 🎁 Drop {num(d['drops'])} · ✨ Rare {num(d['rare'])}",
             f"└ 💰 Gold +{num(d['gold'])} · 🏦 Depo {num(d['deposited'])} · 🛒 List {num(d['listed'])}",
         ]
+        if e.market_ok is False:
+            lines += ["", "🔴 <b>Market ditutup server game</b> — item & gold aman, bot kabari kalau buka."]
         if e.last_error:
             lines += ["", f"⚠️ <i>{esc(e.last_error[:120])}</i>"]
         lines += ["", f"🕒 <i>update {datetime.now():%H:%M:%S}</i>"]
@@ -486,7 +491,9 @@ class TelegramUI:
                  f"├ Termurah     : <b>{fmt_price(low) if low else '-'}</b> POKECRAFT",
                  f"└ Saran harga  : <b>{fmt_price(sug) if sug else '-'}</b> POKECRAFT "
                  f"(-{self.e.store.get('sell_undercut_pct')}%)", "",
-                 "<i>Fee market 5% dipotong dari hasil jual.</i>"]
+                 "<i>Fee market 5% dipotong dari hasil jual. Hasil jual langsung masuk wallet.</i>"]
+        if self.e.market_ok is False:
+            lines += ["", "🔴 <b>Market sedang ditutup server game</b>, jual nanti setelah buka."]
         rows = []
         if free and sug:
             rows.append([B(f"💸 Jual 1 @ {fmt_price(sug)}", callback_data=f"sell:{key}|1|{sug}"),
@@ -504,8 +511,14 @@ class TelegramUI:
         others = [x for x in rows_all if not x.get("mine")]
         gp = await e.gold_price()
         hist = (await e.api.history()).get("history", [])
+        state = {True: "🟢 Buka", False: "🔴 Ditutup server", None: "⏳ Belum dicek"}[e.market_ok]
         lines = ["🛒 <b>MARKETPLACE</b>", LINE,
-                 f"Total listing : <b>{len(rows_all)}</b>",
+                 f"Status        : <b>{state}</b>"]
+        if e.market_ok is False:
+            lines += [f"<i>{esc(e.market_msg)}</i>",
+                      "<i>Masalah ada di server game (token Token-2022 pump.fun belum didukung). "
+                      "Bot cek ulang tiap 30 menit.</i>"]
+        lines += [f"Total listing : <b>{len(rows_all)}</b>",
                  f"Gold termurah : <b>{fmt_price(gp) if gp else '-'}</b> POKECRAFT / 100 gold", "",
                  "🏷 <b>Termurah dari pemain lain</b>"]
         for x in others[:8]:
@@ -528,7 +541,8 @@ class TelegramUI:
             what = what or (f"{num(h['gold'])} gold" if h.get("gold") else h.get("kind", ""))
             side = h.get("side") or h.get("role") or ("jual" if h.get("mine") else "")
             lines.append(f"• {esc(what)} — {esc(h.get('priceUi', ''))} {esc(side)}")
-        return "\n".join(lines), kb(btns + [[B("🔄 Refresh", callback_data="refresh:market")], back()])
+        return "\n".join(lines), kb(btns + [[B("🔄 Refresh", callback_data="refresh:market"),
+                                              B("🩺 Cek market", callback_data="probe:")], back()])
 
     async def scr_bank(self, _=None):
         e = self.e

@@ -59,6 +59,11 @@ class Engine:
         self.next_roll_at = 0
         self.last_error = ""
         self.rotate_i = 0
+        # Market health: the server answers 503 market_disabled while it cannot handle the
+        # token (seen 2026-10-11: "bad token-2022 mint layout").
+        self.market_ok = None
+        self.market_msg = ""
+        self.market_checked = 0
         self._save_lock = asyncio.Lock()
         self._tasks = []
 
@@ -404,8 +409,49 @@ class Engine:
         rows = await self.api.all_listings("all", "new")
         return [x for x in rows if x.get("mine")]
 
+    async def _market_note(self, ok, msg=""):
+        was = self.market_ok
+        self.market_ok, self.market_msg, self.market_checked = ok, msg, time.time()
+        if was is False and ok:
+            self.event("🟢 Market buka lagi")
+            await self.say("🟢 <b>Market Pokecraft sudah buka lagi!</b>\nItem & gold bisa dijual sekarang. Buka 🛒 Market.")
+        elif was is not False and ok is False:
+            self.event(f"🔴 Market ditutup server: {msg}")
+            await self.say(f"🔴 <b>Market ditutup oleh server game</b>\n<i>{msg}</i>\n"
+                           "Item & gold tetap aman di akun. Bot cek ulang tiap 30 menit dan kabari kalau sudah buka.")
+
+    async def _listing_call(self, coro):
+        try:
+            r = await coro
+        except ApiError as e:
+            if e.code == "market_disabled":
+                await self._market_note(False, e.msg)
+            raise
+        await self._market_note(True)
+        return r
+
+    async def probe_market(self):
+        """Market state can only be learned by trying to list. List one common item at a
+        price nobody pays and cancel it right away."""
+        cand = [i for i in self.items if not i.get("locked") and i.get("rarity") == "common"]
+        if not cand:
+            return self.market_ok
+        try:
+            r = await self._listing_call(self.api.list_item(cand[0]["id"], "999999"))
+        except ApiError as e:
+            if e.code != "market_disabled":
+                log.warning("market probe: %s %s", e.code, e.msg)
+            return self.market_ok
+        lid = (r.get("listing") or {}).get("id") or r.get("id") or r.get("listingId")
+        if not lid:
+            lid = next((x["id"] for x in await self.my_listings()
+                        if (x.get("item") or {}).get("id") == cand[0]["id"]), None)
+        if lid:
+            await self.api.cancel_listing(lid)
+        return True
+
     async def sell_item(self, item_id, price):
-        r = await self.api.list_item(item_id, fmt_price(price))
+        r = await self._listing_call(self.api.list_item(item_id, fmt_price(price)))
         it = next((x for x in self.items if x["id"] == item_id), {})
         self.store.bump(listed=1)
         self.event(f"🛒 List {it.get('name', item_id)} @ {fmt_price(price)} POKECRAFT")
@@ -414,14 +460,14 @@ class Engine:
         return r
 
     async def sell_gold(self, gold, price):
-        r = await self.api.list_gold(int(gold), fmt_price(price))
+        r = await self._listing_call(self.api.list_gold(int(gold), fmt_price(price)))
         self.event(f"🛒 List {gold} gold @ {fmt_price(price)} POKECRAFT")
         self.store.save()
         await self.refresh()
         return r
 
     async def _auto_sell(self):
-        if not self.store.get("auto_sell"):
+        if not self.store.get("auto_sell") or self.market_ok is False:
             return
         keep_rare = self.store.get("sell_keep_rare")
         cache = {}
@@ -469,6 +515,8 @@ class Engine:
                             ok, msg = await self.claim_invite(t["id"])
                             if ok:
                                 await self.say(msg)
+                if self.market_ok is not True and time.time() - self.market_checked >= 1800:
+                    await self.probe_market()
                 await self._auto_sell()
                 self.status = self.status if self.status != "starting" else "farming"
             except asyncio.CancelledError:
