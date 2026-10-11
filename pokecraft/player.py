@@ -23,10 +23,15 @@ class Stuck(Exception):
     pass
 
 
+class Paused(Exception):
+    """Raised inside any action when data/pause.flag appears, so the bot stops within a second."""
+
+
 class Player:
-    def __init__(self, browser):
+    def __init__(self, browser, pause_file=None):
         self.b = browser
         self.pitch_sign = None     # learned once: how pitch reacts to a vertical drag
+        self.pause_file = pause_file
 
     # ------------------------------------------------------------------ plumbing
     async def inject(self):
@@ -38,6 +43,10 @@ class Player:
         return json.loads(v) if v is not None else None
 
     async def st(self):
+        if self.pause_file and os.path.exists(self.pause_file):
+            for k in ("KeyW", "KeyA", "KeyS", "KeyD", "ShiftLeft"):
+                await self.b.key(k, False)
+            raise Paused()
         s = await self.js("window.__pkbot ? __pkbot.state() : {phase:'noagent'}")
         if s.get("phase") == "noagent":
             await self.inject()
@@ -428,6 +437,23 @@ class Player:
                 return True
         return False
 
+    async def dig_once(self):
+        """Dig the nearest active dig spot with the shovel (game: click with the shovel within
+        2.4 m of a sparkling spot). Returns True when the game counted a dig."""
+        if not await self.select_item("shovel") and not await self.select_item("wooden_shovel"):
+            return False
+        spots = await self.js("__pkbot.digSpots(70)")
+        if not spots:
+            return False
+        sp = spots[0]
+        before = await self.js("__pk.save.stats.dug")
+        if not await self.walk_to(sp["x"], sp["z"], near=1.4, timeout=90):
+            return False
+        await self.face_xz(sp["x"], sp["z"])
+        await self.click_center_left()
+        await asyncio.sleep(1.8)                 # digging takes ~1.1 s in the game
+        return (await self.js("__pk.save.stats.dug")) > before
+
     async def plant(self, seed, n):
         """Plant up to n seeds on empty farmland around us (hold the seed, right click)."""
         if not await self.select_item(seed):
@@ -579,8 +605,11 @@ class Player:
             if not n:
                 return False
             s = await self.st()
-            if s.get("battle") or s.get("dlg") or s.get("menus"):
-                return False                   # something else needs handling first
+            if s.get("battle"):
+                return False                   # a duel needs handling first
+            if s.get("dlg") or s.get("menus"):
+                await self.close_menus()       # leftover talk / reward card from the last action
+                continue
             f = s.get("focus") or {}
             if f.get("k") == "npc" and f.get("id") == npc_id:
                 return True
@@ -630,14 +659,18 @@ class Player:
         used = set()          # (node, label) already answered: never loop on the same answer
         while time.time() < t_end:
             s = await self.st()
+            if s.get("battle"):
+                break        # a duel started from the talk: the caller plays it, the talk resumes after
             d = s.get("dlg")
             if not d:
-                if not s.get("busy") and not s.get("menus"):
+                if s.get("menus"):
+                    # a shop / vault / museum opened from the talk (the game stays "busy" while it
+                    # is open): hand over to the caller right away
+                    break
+                if not s.get("busy"):
                     idle += 1
                     if idle > 3:
                         break
-                elif s.get("menus") and not s.get("busy"):
-                    break         # a shop / menu opened at the end of the talk: caller handles it
                 await asyncio.sleep(0.3)
                 continue
             idle = 0

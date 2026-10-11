@@ -5,10 +5,12 @@ else is reported as skipped instead of being guessed at."""
 import asyncio
 import logging
 import math
+import os
 import random
 import time
 
 from .battle import Battle
+from .player import Paused
 
 log = logging.getLogger("brain")
 
@@ -257,6 +259,89 @@ class Brain:
         self.act(f"crops growing ({len(crops)}), doing other things meanwhile")
         return "wait"
 
+    async def donate_museum(self, n):
+        """Give museum pieces (fish, bugs, shells, fossils...) to Ferris; catch some first if
+        the bag has none (fish and bugs are museum pieces)."""
+        s = await self.p.st()
+        pieces = []
+        for x in s["inv"]:
+            d = await self.p.js(f"__pkbot.itemDef('{x['id']}')") or {}
+            if d.get("museum"):
+                pieces.append(x["id"])
+        if not pieces:
+            self.act("no museum pieces in the bag: catching fish first")
+            return await self.go_fish(3) > 0
+        if not await self.npc_out("ferris"):
+            return False
+        self.act(f"donate to the museum ({len(pieces)} piece kinds)")
+        await self.p.talk("ferris", goals=["openMuseum"])
+        await asyncio.sleep(1.0)
+        done = 0
+        for b in await self.p.buttons():
+            if b["fid"].startswith("don-") and done < n:
+                await self.p.b.click(b["x"], b["y"])
+                await asyncio.sleep(0.8)
+                done += 1
+        await self.p.close_menus()
+        if done:
+            await self.say(f"🏛 Donasi {done} barang ke museum")
+        return done > 0
+
+    async def sell_for_quest(self, n):
+        """Sell n items at Tilly (quest 'sell': every item sold counts). Sells bag items no quest,
+        museum or befriending needs; picks flowers first if there is nothing to sell."""
+        s = await self.p.st()
+        keep = set(self.KEEP_ALWAYS) | {o.get("item") for q in s["quests"] for o in q["objs"] if o.get("item")}
+        cands = []
+        for x in s["inv"]:
+            if x["id"] in keep or x["id"].endswith("_seed"):
+                continue
+            d = await self.p.js(f"__pkbot.itemDef('{x['id']}')") or {}
+            if d.get("sell") is None or d.get("museum") or d.get("treat") or d.get("heal") or d.get("kind") in ("food", "tool", "seed"):
+                continue
+            cands.append(x)
+        if sum(x["n"] for x in cands) < n:
+            # gather something sellable (flowers lie everywhere)
+            for it in ("flower_purple", "flower_orange", "flower_white", "flower_blue", "flower_pink"):
+                if await self.p.js(f"__pkbot.decorFind('{it}', 80).length"):
+                    await self.p.gather(it, n)
+                    break
+            return True
+        if not await self.npc_out("tilly"):
+            return False
+        self.act(f"sell {n} item(s) at Tilly for a quest")
+        await self.p.talk("tilly", goals=["openShop"])
+        await asyncio.sleep(1.0)
+        await self.p.click_button(fid="tab-sell", wait=0.8)
+        sold = 0
+        for x in cands:
+            if sold >= n:
+                break
+            if await self.p.click_button(fid="row-" + x["id"], wait=0.4):
+                await self.p.click_button(fid="act-all", wait=0.6) or await self.p.click_button(fid="act-go", wait=0.6)
+                sold += x["n"]
+        await self.p.close_menus()
+        return sold > 0
+
+    async def beat_trainer(self, trainer):
+        """Challenge the trainer (the NPC whose talk has battle:<trainer>) and fight the duel."""
+        npc = await self.p.js(f"__pkbot.battleNpc('{trainer}')")
+        if not npc:
+            self.skipped[trainer] = "trainer tidak ditemukan"
+            return False
+        s = await self.p.st()
+        if self.party_frac(s) < 0.95:
+            return await self.heal_if_needed(s, force=True)
+        if not await self.npc_out(npc["id"]):
+            return False
+        self.act(f"challenge {npc['name']} ({trainer})")
+        await self.p.talk(npc["id"], goals=["battle:" + trainer])
+        await asyncio.sleep(1.5)
+        if (await self.p.st()).get("battle"):
+            await self.duel_finish()
+            return True
+        return False
+
     async def go_fish(self, n, want_item=None):
         """Walk to the nearest shore with open water and fish n times (or until want_item)."""
         s = await self.p.st()
@@ -324,6 +409,12 @@ class Brain:
                 continue
             if o["giver"] in inside:
                 continue                       # giver is at home right now (game schedule)
+            if (s.get("invCap") or 30) - len(s["inv"]) < 3:
+                # givers often hand over an item when the quest starts; the game disables the
+                # "accept" answer while the bag is full, so make room first
+                self._bag_at = 0.0
+                if await self.manage_bag(s, min_free=3):
+                    return True
             self.act(f"take quest '{o['title']}' from {o['name']} ({o['d']:.0f} m)")
             await self.p.talk(o["giver"], goals=["giveQuest:" + o["id"]])
             await self.p.close_menus()
@@ -340,8 +431,60 @@ class Brain:
                    "wooden_pickaxe", "wooden_axe", "stone_pickaxe", "stone_axe", "iron_pickaxe", "iron_axe",
                    "oak_log", "birch_log", "blk_planks", "stick"}
 
+    TOOL_RANK = {  # same job, better tool last: keep only the best one of each
+        "hoe": ["hoe", "wooden_hoe", "stone_hoe", "iron_hoe"],
+        "can": ["watering_can"],
+        "shovel": ["shovel", "wooden_shovel", "stone_shovel", "iron_shovel"],
+        "rod": ["fishing_rod"],
+        "net": ["bug_net"],
+        "pick": ["wooden_pickaxe", "stone_pickaxe", "iron_pickaxe"],
+        "axe": ["wooden_axe", "stone_axe", "iron_axe"],
+    }
+
+    async def drop_junk(self, s, keep):
+        """Drop what can't be sold and isn't needed: duplicate/obsolete tools and unsellable
+        leftovers (bag menu > slot > Drop). Returns how many slots were freed."""
+        drop = []
+        for group in self.TOOL_RANK.values():
+            owned = [x for x in s["inv"] if x["id"] in group]
+            if len(owned) > 1:
+                best = max(owned, key=lambda x: group.index(x["id"]))
+                drop += [x for x in owned if x is not best]
+        for x in s["inv"]:
+            if x in drop or x["id"] in keep or x["id"].endswith("_seed"):
+                continue
+            if any(x["id"] in g for g in self.TOOL_RANK.values()):
+                continue
+            d = await self.p.js(f"__pkbot.itemDef('{x['id']}')") or {}
+            if d.get("sell") is None and d.get("kind") == "resource" and x["id"].startswith("blk_"):
+                drop.append(x)                 # stray terrain blocks picked up while clearing paths
+        if not drop:
+            return 0
+        # Dropped items fly back (ground items are pulled to the player within 2.9 m), so park
+        # them in the personal bank vault instead (banker > Vault: bag slot > "Move all to vault").
+        banker = next((n for n in await self.p.js("__pkbot.npcs()")
+                       if n["id"].startswith("banker:") and n.get("state") != "inside"), None)
+        if not banker:
+            return 0
+        self.act(f"store {len(drop)} unneeded item(s) in the bank vault: {[x['id'] for x in drop]}")
+        await self.p.talk(banker["id"], goals=["openBank"])
+        await asyncio.sleep(1.0)
+        if not any("storage" in l or "vault" in l or "box" in l for l in (await self.p.st()).get("layers", [])):
+            log.info("vault did not open (layers %s)", (await self.p.st()).get("layers"))
+            await self.p.close_menus()
+            return 0
+        freed = 0
+        for x in drop:
+            if await self.p.click_button(fid=f"bag-{x['i']}", wait=0.4) and \
+               await self.p.click_button(fid="st-quick", wait=0.6):
+                now = await self.p.st()
+                if not any(y["i"] == x["i"] and y["id"] == x["id"] for y in now["inv"]):
+                    freed += 1
+        await self.p.close_menus()
+        return freed
+
     async def manage_bag(self, s, min_free=4):
-        """Bag almost full: sell what no quest, museum, crafting or befriending needs to Tilly."""
+        """Bag almost full: drop junk, sell what nothing needs to Tilly, donate museum pieces."""
         free = (s.get("invCap") or 30) - len(s["inv"])
         if free >= min_free or time.time() - self._bag_at < 600:
             return False
@@ -351,16 +494,27 @@ class Brain:
             for o in q["objs"]:
                 if o.get("item"):
                     keep.add(o["item"])
+        if await self.drop_junk(s, keep):
+            s = await self.p.st()
+            if (s.get("invCap") or 30) - len(s["inv"]) >= min_free:
+                return True
         sell = []
+        museum = []
         for x in s["inv"]:
             if x["id"] in keep or x["id"].endswith("_seed"):
                 continue
             d = await self.p.js(f"__pkbot.itemDef('{x['id']}')") or {}
-            if d.get("sell") is None or d.get("museum") or d.get("treat") or d.get("heal") or d.get("kind") in ("food", "tool", "seed"):
+            if d.get("museum"):
+                museum.append(x["id"])
+                continue
+            crop = d.get("kind") == "crop"     # harvest is for selling unless a quest wants it
+            if d.get("sell") is None or (not crop and (d.get("treat") or d.get("heal") or d.get("kind") in ("food", "tool", "seed"))):
                 continue
             sell.append(x["id"])
-        if not sell:
-            log.info("bag full (%d free) but nothing safe to sell", free)
+        if not sell or not await self.npc_out("tilly"):
+            if museum and await self.npc_out("ferris"):
+                return await self.donate_museum(len(museum))
+            log.info("bag full (%d free): nothing to sell or Tilly/Ferris not out", free)
             return False
         self.act(f"bag full ({free} free): selling {len(sell)} kinds at Tilly")
         await self.p.talk("tilly", goals=["openShop"])
@@ -727,6 +881,18 @@ class Brain:
                     ok = got > 0
                 elif kind == "fish":
                     ok = await self.go_fish(min(left, 5)) > 0
+                elif kind == "dig":
+                    got = 0
+                    for _ in range(min(left, 4)):
+                        if await self.p.dig_once():
+                            got += 1
+                    ok = got > 0
+                elif kind == "donate":
+                    ok = await self.donate_museum(left)
+                elif kind == "sell":
+                    ok = await self.sell_for_quest(left)
+                elif kind == "beat" and o.get("trainer"):
+                    ok = await self.beat_trainer(o["trainer"])
                 elif kind == "plant":
                     ok = await self.do_plant(s, left, o.get("crop"))
                 elif kind == "harvest":
@@ -781,7 +947,15 @@ class Brain:
 
     async def run(self, stop):
         self._mark, self._mark_at, self._current_key = None, time.time(), None
+        pause_flag = os.path.join(os.path.dirname(self.store.path), "pause.flag") if self.store and hasattr(self.store, "path") else None
+        self.p.pause_file = pause_flag
         while not stop.is_set():
+            if pause_flag and os.path.exists(pause_flag):
+                # paused (maintenance / testing in the same game window): no actions at all
+                self.status = "paused"
+                await asyncio.sleep(2)
+                self._mark_at = time.time()
+                continue
             try:
                 s = await self.p.st()
                 m = self._progress_mark(s)
@@ -794,6 +968,8 @@ class Brain:
                 await asyncio.wait_for(self.step(), 300)   # watchdog: no single step may hang
                 if time.time() - t0 < 0.4:
                     await asyncio.sleep(1.0)               # a step that did nothing: never spin
+            except Paused:
+                log.info("PAUSED (pause.flag)")
             except asyncio.TimeoutError:
                 log.warning("WATCHDOG step took > 5 min (last: %s), resetting", self.last_action)
                 await self.p.hold(["KeyW", "ShiftLeft"], False)

@@ -3,7 +3,7 @@
 (() => {
   const G = () => window.__pk;
   const X = () => window.__pkx || {};
-  const B = { ver: 15 };
+  const B = { ver: 16 };
 
   B.blockName = (id) => { const d = X().Du && X().Du[id]; return d ? d.name : String(id); };
   B.blockIds = (re) => {
@@ -129,6 +129,24 @@
     }
     return out.sort((a, b) => a.d - b.d).slice(0, 40);
   };
+  // Dig spots that are active again (game digSpots: respawn after a while), nearest first.
+  B.digSpots = (r) => {
+    const g = G(); const p = g.player.pos; r = r || 60; const now = Date.now();
+    return g.digSpots.spots.filter((s) => g.digSpots.isActive(s, now))
+      .map((s) => ({ i: s.i, x: s.x + 0.5, y: s.y, z: s.z + 0.5, d: Math.hypot(s.x + 0.5 - p.x, s.z + 0.5 - p.z) }))
+      .filter((s) => s.d <= r).sort((a, b) => a.d - b.d).slice(0, 10);
+  };
+  // NPC whose talk can start a given battle (dialogue action battle:<trainer>).
+  B.battleNpc = (trainer) => {
+    for (const a of G().npcs.actors) {
+      for (const n of a.def.nodes || []) {
+        const all = [].concat(n.action || [], ...(n.choices || []).map((c) => [].concat(c.action || [])));
+        if (all.some((x) => x && x.do === 'battle' && x.trainer === trainer)) return { id: a.def.id, name: a.def.name };
+      }
+    }
+    return null;
+  };
+
   // Bugs flying around (game bugs.live), nearest first.
   B.bugs = (r) => {
     const g = G(); const p = g.player.pos; r = r || 50;

@@ -58,6 +58,8 @@ class GameRunner:
         self.state = "off"
 
     async def _close(self):
+        if self.player:
+            self.player.pause_file = None          # closing must work even while paused
         if self.player and self.browser and self.browser.alive:
             try:   # let the game write its online save first: pause menu > Save now
                 await self.player.close_menus()
@@ -125,9 +127,11 @@ class GameRunner:
                             await self.e.say("🪟 Jendela game jangan di-minimize (game jadi berhenti).\n"
                                              "Pakai tombol <b>🙈 Sembunyikan</b> di menu 🎮 Game kalau mau disembunyikan.")
                         try:
-                            self.last = await asyncio.wait_for(self.player.st(), 20)
+                            # raw read: the health check must not be affected by the pause flag
+                            self.last = await asyncio.wait_for(
+                                self.player.js("window.__pkbot ? __pkbot.state() : {phase: 'noagent'}"), 20)
                         except Exception as ex:  # noqa: BLE001
-                            raise RuntimeError(f"game tidak merespons: {ex}") from ex
+                            raise RuntimeError(f"game tidak merespons: {ex!r}") from ex
                 finally:
                     brain_task.cancel()
                     try:
