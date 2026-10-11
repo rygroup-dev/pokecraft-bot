@@ -5,6 +5,7 @@ else is reported as skipped instead of being guessed at."""
 import asyncio
 import logging
 import math
+import random
 import time
 
 from .battle import Battle
@@ -12,6 +13,25 @@ from .battle import Battle
 log = logging.getLogger("brain")
 
 FOODS = ("cookie", "berry", "apple", "mega_berry", "honey_cake", "fruit_pie", "bread")
+
+
+class Fails(dict):
+    """Failure counters that forget a key 15 minutes after its last failure, so a task that
+    failed for a temporary reason (NPC away, path blocked) is tried again later."""
+
+    def __init__(self, ttl=900):
+        super().__init__()
+        self.ttl = ttl
+        self.when = {}
+
+    def get(self, key, default=0):
+        if key in self and time.time() - self.when.get(key, 0) > self.ttl:
+            del self[key]
+        return super().get(key, default)
+
+    def __setitem__(self, key, value):
+        self.when[key] = time.time()
+        super().__setitem__(key, value)
 
 
 class Brain:
@@ -25,7 +45,9 @@ class Brain:
         self.last_action = ""
         self.skipped = {}            # quest id -> reason
         self.stats = {"duels": 0, "wins": 0, "befriended": 0, "quests": 0, "gold_start": None}
-        self._fail = {}
+        self._fail = Fails()
+        self._unreach = {}          # wild creature id -> time it was found unreachable
+        self._bug_places = set()
         self._heal_fail = 0
         self._heal_pause = 0.0
 
@@ -55,6 +77,11 @@ class Brain:
             return
         if self.stats["gold_start"] is None:
             self.stats["gold_start"] = s.get("gems")
+        if s.get("photo"):
+            self.act("leave photo mode")     # photo mode hides the whole HUD
+            await self.p.b.tap("Escape")
+            await asyncio.sleep(0.8)
+            return
         if s.get("battle"):
             self.act("battle in progress")
             await self.duel_finish()
@@ -65,15 +92,20 @@ class Brain:
         if s.get("menus") or s.get("busy"):
             await self.p.close_menus()
             return
+        if s.get("swim") and not await self._water_task(s):
+            await self.back_to_land(s)
+            return
         if await self.heal_if_needed(s):
             return
         if await self.deposit_ui(s):
             return
         if await self.turn_in(s):
             return
-        if await self.journey(s):
+        if await self.take_offers(s):
             return
         if await self.quests(s):
+            return
+        if await self.journey(s):
             return
         await self.grind(s)
 
@@ -97,7 +129,7 @@ class Brain:
         if time.time() < self._heal_pause:
             return False
         self.act(f"heal party at {healer['name']} ({self.party_frac(s):.0%} HP)")
-        await self.p.talk(healer["id"], want=["heal"])
+        await self.p.talk(healer["id"], goals=["heal"], want=["heal"])
         await self.p.close_menus()
         after = await self.p.st()
         if self.party_frac(after) < 0.999:
@@ -139,10 +171,92 @@ class Brain:
         after = await self.p.st()
         moved = gems - int(after.get("gems") or 0)
         if ok and moved > 0:
-            await self.say(f"🏦 Deposit {moved} gold kantong → bank (dari dalam game)")
+            await self.say(f"ðŸ¦ Deposit {moved} gold kantong â†’ bank (dari dalam game)")
         else:
             log.info("deposit via wallet did not move gold (ok=%s)", ok)
         return True
+
+    async def land_point(self, s, rmin=12, rmax=24, center=None, tries=10):
+        """A random spot we can walk to on land (no swimming on the way), checked with A*."""
+        cx, cz = center if center else (s["pos"]["x"], s["pos"]["z"])
+        swimming = bool(s.get("swim"))
+        for _ in range(tries):
+            ang = random.uniform(0, 2 * math.pi)
+            r = random.uniform(rmin, rmax)
+            x, z = cx + r * math.cos(ang), cz + r * math.sin(ang)
+            plan = await self.p.js(f"__pkbot.path({x:.1f}, {z:.1f}, {{near: 1.5, max: 30000}})")
+            pts = plan.get("pts") or []
+            if not plan.get("ok") or not pts or pts[-1][3]:
+                continue                       # the spot itself must be dry land
+            if swimming or not any(pt[3] for pt in pts):
+                return x, z
+        return None
+
+    async def _water_task(self, s):
+        """True when the current goal is across the water (crossing to Birchwick etc.)."""
+        return any(q["id"] in ("jr_open", "jr_bank", "jr_cave") and q["phase"] == "active" for q in s["quests"])
+
+    async def back_to_land(self, s):
+        """In the water with nothing to do there: swim to the nearest dry land (or the village)."""
+        p = s["pos"]
+        if math.hypot(p["x"] - 46, p["z"] - 72) > 80:
+            # far from the home island (quest givers live there): swim home instead of to the
+            # nearest beach, so trips across the sea are not undone halfway
+            self.act("in the water far from home: swimming back to the village")
+            return await self.p.walk_to(46, 72, near=4, timeout=400)
+        self.act("in the water: swimming back to land")
+        for rmin, rmax in ((3, 12), (8, 25), (20, 45)):
+            pt = await self.land_point(s, rmin, rmax, tries=12)
+            if pt:
+                return await self.p.walk_to(pt[0], pt[1], near=2, timeout=150)
+        return await self.p.walk_to(46, 72, near=4, timeout=300)
+
+    async def till_somewhere(self, n):
+        """Go to open ground outside the protected village and till n patches."""
+        here = await self.p.js("__pkbot.tillable(4)")
+        if len(here) < 4:
+            spot = await self.p.js("__pkbot.findTillSpot(60, 8)")
+            if not spot:
+                log.info("no open tillable ground within 60 m")
+                return False
+            self.act(f"walk to open ground {spot['x']:.0f},{spot['z']:.0f} to till ({spot['n']} patches)")
+            if not await self.p.walk_to(spot["x"], spot["z"], near=1.2, timeout=120):
+                return False
+        got = await self.p.till(n)
+        self.act(f"tilled {got} patch(es)")
+        return got > 0
+
+    async def wander(self, why):
+        """Walk to another reachable meadow spot so new wild creatures come into range."""
+        s = await self.p.st()
+        pt = await self.land_point(s, 15, 30) or await self.land_point(s, 10, 25, center=(46, 72))
+        self.act(f"{why}: walking to a new spot")
+        if pt:
+            await self.p.walk_to(pt[0], pt[1], near=3, timeout=60)
+        else:
+            await asyncio.sleep(5)
+        return True
+
+    async def take_offers(self, s, radius=200):
+        """Accept quests the game offers from nearby NPCs (dialogue action giveQuest)."""
+        offers = await self.p.js("__pkbot.offers()")
+        shown = {n["id"]: n.get("shown") for n in await self.p.js("__pkbot.npcs()")}
+        for o in offers:
+            if o["d"] > radius or self._fail.get("offer:" + o["id"], 0) >= 2:
+                continue
+            if not shown.get(o["giver"]) and o["d"] < 30:
+                continue                       # giver is asleep / indoors right now
+            self.act(f"take quest '{o['title']}' from {o['name']} ({o['d']:.0f} m)")
+            await self.p.talk(o["giver"], goals=["giveQuest:" + o["id"]])
+            await self.p.close_menus()
+            s2 = await self.p.st()
+            if any(q["id"] == o["id"] for q in s2["quests"]):
+                await self.say(f"ðŸ“œ Quest baru: <b>{o['title']}</b> dari {o['name']}")
+            else:
+                self._fail["offer:" + o["id"]] = self._fail.get("offer:" + o["id"], 0) + 1
+                log.info("offer %s not taken (dialogue did not give it)", o["id"])
+            return True
+        return False
 
     async def turn_in(self, s):
         for q in s["quests"]:
@@ -154,10 +268,11 @@ class Brain:
             if not giver or giver == "anywhere":
                 continue
             key = "turnin:" + q["id"]
+            self._current_key = key
             if self._fail.get(key, 0) >= 3:
                 continue
             self.act(f"turn in '{q['title']}' to {giver}")
-            tr = await self.p.talk(giver, want=["here", "hand", "brought", "done", "finished", "give", "yes"])
+            tr = await self.p.talk(giver, goals=["turnIn:" + q["id"]])
             if tr is None:
                 self._fail[key] = self._fail.get(key, 0) + 1
                 continue
@@ -165,7 +280,7 @@ class Brain:
             s2 = await self.p.st()
             if not any(x["id"] == q["id"] for x in s2["quests"]):
                 self.stats["quests"] += 1
-                await self.say(f"📜 Quest selesai: <b>{q['title']}</b> (gold {s2['gems']})")
+                await self.say(f"ðŸ“œ Quest selesai: <b>{q['title']}</b> (gold {s2['gems']})")
             else:
                 self._fail[key] = self._fail.get(key, 0) + 1
             return True
@@ -184,8 +299,13 @@ class Brain:
             self.skipped[jq["id"]] = "gagal 5x"
             return False
         self.status = f"journey: {jq['title']}"
+        self._current_key = jq["id"]
+        before = self._progress_mark(s)
         ok = await h(s, jq)
-        if ok is False:
+        after = self._progress_mark(await self.p.st())
+        if ok is False or (before is not None and before[2:] == after[2:]):
+            # handler failed, or claimed success but nothing changed in the game (xp, gold,
+            # quests, party, bag): count it so the same step is not retried in a tight loop
             self._fail[jq["id"]] = self._fail.get(jq["id"], 0) + 1
         return True
 
@@ -279,6 +399,15 @@ class Brain:
         pl = next((x for x in places if x["id"] == place_id), None)
         if not pl:
             return False
+        if not await self.p.js(f"__pkbot.discoverable('{place_id}')"):
+            # game bug: the place is not in the game's discoverable place table, so standing in
+            # it never counts as a visit. Do not walk back and forth for nothing.
+            if place_id not in self._bug_places:
+                self._bug_places.add(place_id)
+                await self.say(f"🐞 Bug game: <b>{place_id}</b> tidak bisa 'ditemukan' di versi game ini "
+                               f"(tidak ada di daftar tempat game), quest kunjungan ke sana dilewati.")
+            self.skipped[place_id] = "bug game: tempat tidak terdaftar, kunjungan tidak terhitung"
+            return False
         self.act(f"travel to {pl['name']}")
         return await self.p.walk_to(pl["x"], pl["z"], near=4, timeout=600)
 
@@ -290,13 +419,21 @@ class Brain:
         wilds = await self.p.js("__pkbot.wilds(70)")
         cands = [w for w in wilds if w["level"] <= lead["level"] + 1]
         if not cands:
-            # nothing weak nearby: wander to a random meadow point around the village
-            self.act("no weak wild creatures near, walking around")
-            p = s["pos"]
-            ang = (time.time() * 0.7) % (2 * math.pi)
-            await self.p.walk_to(p["x"] + 18 * math.cos(ang), p["z"] + 18 * math.sin(ang), near=3, timeout=40)
-            return True
-        w = min(cands, key=lambda c: (c["level"] + c["d"] / 25, c["d"]))
+            return await self.wander("no weak wild creatures near")
+        now = time.time()
+        self._unreach = {k: t for k, t in self._unreach.items() if now - t < 600}
+        w = None
+        for c in sorted(cands, key=lambda c: (c["level"] + c["d"] / 25, c["d"])):
+            if c["id"] in self._unreach:
+                continue
+            plan = await self.p.js(f"__pkbot.path({c['x']}, {c['z']}, {{near: 1.8, max: 40000}})")
+            if plan.get("ok"):
+                w = c
+                break
+            self._unreach[c["id"]] = now
+            log.info("wild %s Lv%s at %.0f,%.0f is not reachable on foot", c["species"], c["level"], c["x"], c["z"])
+        if not w:
+            return await self.wander("no reachable weak wild creature")
         self.act(f"go duel {w['species']} Lv{w['level']} ({w['d']:.0f} m)")
         await self.ensure_empty_hand_for_duel()
         if not await self.approach_wild(w["id"]):
@@ -318,7 +455,7 @@ class Brain:
         won = any("tuckered out" in l or "fainted" in l and "Wild" in l for l in lines) or after.get("gems", 0) > before.get("gems", 0)
         if any("joined your party" in l or "went to the Box" in l for l in lines):
             self.stats["befriended"] += 1
-            await self.say(f"🐾 Teman baru bergabung! ({res})")
+            await self.say(f"ðŸ¾ Teman baru bergabung! ({res})")
         elif won:
             self.stats["wins"] += 1
         await asyncio.sleep(4.2)       # game duel cooldown is 4 s
@@ -385,7 +522,7 @@ class Brain:
             s2 = await self.p.st()
             if s2.get("menus"):            # "new friend" card
                 self.stats["befriended"] += 1
-                await self.say(f"🐾 {w['species']} jadi teman baru!")
+                await self.say(f"ðŸ¾ {w['species']} jadi teman baru!")
                 await self.p.close_menus()
                 return True
         return False
@@ -400,19 +537,58 @@ class Brain:
                 if done:
                     continue
                 key = f"{q['id']}:{i}"
+                self._current_key = key
                 if self._fail.get(key, 0) >= 3:
                     continue
-                if o["kind"] == "talk" and o.get("npc"):
-                    self.act(f"quest '{q['title']}': talk to {o['npc']}")
+                left = max(1, (o.get("n") or 1) - (o.get("have") or 0))
+                kind = o["kind"]
+                self.act(f"quest '{q['title']}': {kind} ({o.get('have') or 0}/{o.get('n') or 1})")
+                if kind == "talk" and o.get("npc"):
                     ok = await self.p.talk(o["npc"]) is not None
                     await self.p.close_menus()
-                elif o["kind"] == "visit" and o.get("place"):
+                elif kind == "visit" and o.get("place"):
                     ok = await self.go_place(o["place"])
-                elif o["kind"] in ("win", "beat") and o["kind"] == "win":
+                elif kind == "win":
                     ok = await self.duel_weakest(s)
+                elif kind == "befriend":
+                    ok = await self.befriend_one(s)
+                elif kind == "jump":
+                    for _ in range(min(left, 40)):
+                        await self.p.b.tap("Space", 0.08)
+                        await asyncio.sleep(0.75)
+                    ok = True
+                elif kind == "sprint":
+                    # sprint only counts on land: run between walkable spots near the village
+                    pt = await self.land_point(s, 15, 28) or await self.land_point(s, 10, 22, center=(46, 72))
+                    ok = bool(pt) and await self.p.walk_to(pt[0], pt[1], near=2.5, timeout=60)
+                elif kind == "emote":
+                    ok = await self.p.emote(o.get("emote") or "wave")
+                elif kind == "pet":
+                    ok = await self.p.pet_buddy()
+                elif kind in ("have", "gain") and o.get("item"):
+                    have_now = sum(x["n"] for x in s["inv"] if x["id"] == o["item"])
+                    need = (o.get("n") or 1) - have_now
+                    if need <= 0:
+                        ok = True          # already in the bag; the quest turns ready on its own
+                    elif await self.p.js(f"__pkbot.decorFind('{o['item']}', 120).length"):
+                        ok = await self.p.gather(o["item"], need) > 0
+                    else:
+                        self.skipped[q["id"]] = f"item '{o['item']}' tidak bisa dipungut di sekitar"
+                        self._fail[key] = 99      # look again in 15 minutes, not every loop
+                        continue
+                elif kind == "place" and not o.get("block"):
+                    # any placement counts (game emits "place" for tilled farmland too)
+                    ok = await self.till_somewhere(min(left, 12))
                 else:
-                    self.skipped[q["id"]] = f"tugas '{o['kind']}' belum didukung"
+                    self.skipped[q["id"]] = f"tugas '{kind}' belum didukung"
+                    self._fail[key] = 99
                     continue
+                s2 = await self.p.st()
+                q2 = next((x for x in s2["quests"] if x["id"] == q["id"]), None)
+                prog = q2["objs"][i].get("have") if q2 else None
+                if q2 and prog == o.get("have"):
+                    ok = False            # nothing changed in the game: count as a failed try
+                    log.info("quest %s obj %d (%s) did not move", q["id"], i, kind)
                 if not ok:
                     self._fail[key] = self._fail.get(key, 0) + 1
                 return True
@@ -423,10 +599,43 @@ class Brain:
         self.status = "grind duels"
         await self.duel_weakest(s)
 
+    def _progress_mark(self, s):
+        if not s.get("pos"):
+            return None
+        q = tuple(sorted((x["id"], x.get("phase"), tuple(o.get("have") or 0 for o in x["objs"]))
+                         for x in s.get("quests", [])))
+        p = s["pos"]
+        return (round(p["x"] / 3), round(p["z"] / 3), s.get("xp"), s.get("lvl"), s.get("gems"), q,
+                len(s.get("party", [])), sum(x["n"] for x in s.get("inv", [])))
+
+    async def self_heal(self):
+        """Nothing changed in the game for minutes: reset input, get free, try another task."""
+        log.warning("SELF-HEAL: no progress for %ds (last: %s)", int(time.time() - self._mark_at), self.last_action)
+        await self.say(f"ðŸ›  Bot sempat diam, memperbaiki diri sendiriâ€¦\n<i>{self.last_action[:120]}</i>")
+        for k in ("KeyW", "KeyA", "KeyS", "KeyD", "ShiftLeft", "KeyG"):
+            await self.p.b.key(k, False)
+        await self.p.close_menus()
+        await self.p.unstick()
+        key = self._current_key
+        if key:
+            self._fail[key] = 99          # skip this task for a while (Fails forgets it after 15 min)
+        self._unreach.clear()
+
     async def run(self, stop):
+        self._mark, self._mark_at, self._current_key = None, time.time(), None
         while not stop.is_set():
             try:
+                s = await self.p.st()
+                m = self._progress_mark(s)
+                if m != self._mark:
+                    self._mark, self._mark_at = m, time.time()
+                elif time.time() - self._mark_at > 240 and s.get("phase") == "play":
+                    await self.self_heal()
+                    self._mark_at = time.time()
+                t0 = time.time()
                 await asyncio.wait_for(self.step(), 300)   # watchdog: no single step may hang
+                if time.time() - t0 < 0.4:
+                    await asyncio.sleep(1.0)               # a step that did nothing: never spin
             except asyncio.TimeoutError:
                 log.warning("WATCHDOG step took > 5 min (last: %s), resetting", self.last_action)
                 await self.p.hold(["KeyW", "ShiftLeft"], False)

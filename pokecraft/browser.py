@@ -281,6 +281,33 @@ class Browser:
         cx, cy = self.size[0] // 2, self.size[1] // 2
         await self.click(cx, cy, button)
 
+    # ------------------------------------------------------------------ window
+    # A minimized window stops requestAnimationFrame, which freezes the game (battles hang).
+    async def window(self):
+        return await self.send("Browser.getWindowForTarget", {})
+
+    async def ensure_not_minimized(self):
+        w = await self.window()
+        if w["bounds"].get("windowState") == "minimized":
+            await self.send("Browser.setWindowBounds", {"windowId": w["windowId"],
+                                                        "bounds": {"windowState": "normal"}})
+            return True
+        return False
+
+    async def set_hidden(self, hidden):
+        """Hidden = moved off-screen (still rendering), so the PC stays usable."""
+        w = await self.window()
+        if w["bounds"].get("windowState") != "normal":
+            await self.send("Browser.setWindowBounds", {"windowId": w["windowId"], "bounds": {"windowState": "normal"}})
+        left, top = (-4000, 10) if hidden else (10, 10)
+        await self.send("Browser.setWindowBounds", {"windowId": w["windowId"],
+                                                    "bounds": {"left": left, "top": top}})
+
+    async def fps(self):
+        return await self.eval("new Promise(r => { let c = 0; const t0 = performance.now();"
+                               " const f = () => { c++; if (performance.now() - t0 < 1000) requestAnimationFrame(f); else r(c); };"
+                               " requestAnimationFrame(f); setTimeout(() => r(c), 1500); })")
+
     async def screenshot(self, path):
         r = await self.send("Page.captureScreenshot", {"format": "png"})
         with open(path, "wb") as f:

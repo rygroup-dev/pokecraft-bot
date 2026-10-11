@@ -1,4 +1,5 @@
 """Pokecraft bot entry point: farming engine + Telegram dashboard."""
+import asyncio
 import logging
 import os
 import socket
@@ -48,7 +49,7 @@ def single_instance():
         s.bind(("127.0.0.1", LOCK_PORT))
     except OSError:
         print("[error] Bot Pokecraft sudah jalan di komputer ini. 1 komputer = 1 bot = 1 akun.")
-        sys.exit(1)
+        sys.exit(3)
     return s  # keep the socket open for the whole run
 
 
@@ -74,11 +75,34 @@ def main():
     ui = TelegramUI(need("TELEGRAM_BOT_TOKEN"), owner, engine)
     orig = ui.app.post_init
 
+    stop_flag = os.path.join(ROOT, "data", "stop.flag")
+
+    async def watch_stop_flag():
+        """Create data/stop.flag to stop cleanly: the game saves first, then the bot exits."""
+        while not os.path.exists(stop_flag):
+            await asyncio.sleep(2)
+        os.remove(stop_flag)
+        logging.getLogger("main").info("STOP requested via stop.flag")
+        if engine.game and engine.game.running:
+            await engine.game.stop()
+            store.set("game_on", True)       # stop.flag is a restart, not "turn the game off"
+        await engine.stop()
+        for t in engine._tasks:
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        r = getattr(ui, "_refresher", None)
+        if r:
+            r.cancel()
+        ui.app.stop_running()
+
     async def post_init(app):
         await orig(app)
         engine.start()
         if store.get("game_on") and engine.game.available:
             await engine.game.start()
+        asyncio.get_running_loop().create_task(watch_stop_flag())
     ui.app.post_init = post_init
     logging.getLogger("main").info("START wallet=%s", wallet.address)
     ui.run()

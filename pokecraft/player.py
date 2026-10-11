@@ -149,6 +149,7 @@ class Player:
         tried = 0
         try:
             for wx, wz, wy, swim in pts:
+                turns = 0
                 while True:
                     if time.time() > t_end:
                         return False
@@ -161,9 +162,20 @@ class Player:
                         break
                     want = math.atan2(-(wx - p["x"]), -(wz - p["z"]))
                     d = wrap(want - s["yaw"])
+                    if dist < 1.5 and abs(d) > 1.2:
+                        break                  # passed it already: don't spin round for it
+                    if not swim and not s.get("swim") and p["y"] < wy - 1.5 and dist < 2.5:
+                        # a ledge right in front that we are under (we fell or the plan was off)
+                        log.info("WALK ledge above us (%.1f < %d) at %.1f,%.1f, avoiding it", p["y"], wy, wx, wz)
+                        return (int(math.floor(wx)), int(math.floor(wz)))
                     if abs(d) > 0.25:
+                        turns += 1
+                        if turns > 4:
+                            log.info("WALK turned %d times for one waypoint, replanning", turns)
+                            return (int(math.floor(wx)), int(math.floor(wz)))
                         await self.hold(["KeyW", "ShiftLeft"], False)
                         await self.turn(d)
+                        await asyncio.sleep(0.05)
                         continue
                     if abs(d) > 0.08:
                         await self.turn(d)
@@ -271,6 +283,96 @@ class Player:
         await self.b.tap("KeyE")
         await asyncio.sleep(0.3)
 
+    async def right_click(self):
+        cx, cy = self.b.size[0] // 2, self.b.size[1] // 2
+        for t in ("mousePressed", "mouseReleased"):
+            await self.b.send("Input.dispatchMouseEvent", {"type": t, "x": cx, "y": cy, "button": "right",
+                                                           "buttons": 2 if t == "mousePressed" else 0,
+                                                           "clickCount": 1})
+            await asyncio.sleep(0.08)
+
+    async def till(self, n):
+        """Till up to n patches of grass/dirt around us with the hoe (game farm.till).
+        Returns how many patches became Farmland."""
+        if not await self.select_item("hoe") and not await self.select_item("wooden_hoe"):
+            return 0
+        done = 0
+        for c in (await self.js("__pkbot.tillable(4)"))[: n + 4]:
+            if done >= n:
+                break
+            if c["d"] > 3.2 or c["d"] < 0.9:
+                continue
+            if not await self.aim(c["x"], c["y"], c["z"]):
+                continue
+            await self.right_click()
+            await asyncio.sleep(0.35)
+            name = await self.js(f"__pkbot.blockName(__pk.world.get({c['x']},{c['y']},{c['z']}))")
+            if name == "Farmland":
+                done += 1
+        return done
+
+    async def gather(self, item, n, radius=70, timeout=240):
+        """Pick up n decorations that give `item` (walk next to each, press E when the game
+        offers 'Pick up …'). Returns how many were picked."""
+        t_end = time.time() + timeout
+        got = 0
+        skip = set()
+        while got < n and time.time() < t_end:
+            spots = [d for d in await self.js(f"__pkbot.decorFind('{item}', {radius})")
+                     if (round(d["x"], 1), round(d["z"], 1)) not in skip]
+            if not spots:
+                break
+            d = spots[0]
+            key = (round(d["x"], 1), round(d["z"], 1))
+            before = sum(x["n"] for x in (await self.st())["inv"] if x["id"] == item)
+            if not await self.walk_to(d["x"], d["z"], near=1.0, timeout=60):
+                skip.add(key)
+                continue
+            s = await self.st()
+            if (s.get("focus") or {}).get("k") != "decor":
+                await self.face_xz(d["x"], d["z"])
+                await asyncio.sleep(0.3)
+            await self.interact()
+            await asyncio.sleep(0.5)
+            after = sum(x["n"] for x in (await self.st())["inv"] if x["id"] == item)
+            if after > before:
+                got += after - before
+            else:
+                skip.add(key)
+        return got
+
+    async def emote(self, emote_id):
+        """Hold G to open the emote wheel and click the emote's slot (its title is the label)."""
+        await self.b.key("KeyG", True)
+        await asyncio.sleep(0.35)
+        slots = await self.js("Array.from(document.querySelectorAll('.hd-wheel.open .ws')).map(e => {"
+                              " const r = e.getBoundingClientRect(); return {t: e.title, x: r.x + r.width/2, y: r.y + r.height/2}; })")
+        hit = next((x for x in slots or [] if x["t"].lower() == emote_id.lower()), None)
+        if hit:
+            await self.b.click(hit["x"], hit["y"])
+        await asyncio.sleep(0.2)
+        await self.b.key("KeyG", False)
+        await asyncio.sleep(2.4)          # let the emote play (wave lasts ~2.3 s)
+        return bool(hit)
+
+    async def pet_buddy(self):
+        """Walk up to the buddy and press E when the game offers 'Pet'."""
+        for _ in range(6):
+            s = await self.st()
+            if (s.get("focus") or {}).get("k") == "buddy":
+                await self.interact()
+                await asyncio.sleep(1.2)
+                return True
+            bud = await self.js("__pkbot.buddy()")
+            if not bud:
+                return False
+            await self.face_xz(bud["x"], bud["z"])
+            await self.b.key("KeyW", True)
+            await asyncio.sleep(0.25)
+            await self.b.key("KeyW", False)
+            await asyncio.sleep(0.6)
+        return False
+
     # ------------------------------------------------------------------ menus
     async def buttons(self, all_layers=False):
         return await self.js(f"__pkbot.buttons({'true' if all_layers else 'false'})")
@@ -303,17 +405,31 @@ class Player:
         """Walk next to an NPC (it may wander, so re-read its position) until the game
         focuses it (the 'E Talk to …' prompt)."""
         t_end = time.time() + timeout
+        tries = 0
         while time.time() < t_end:
             npcs = await self.js("__pkbot.npcs()")
             n = next((x for x in npcs if x["id"] == npc_id), None)
             if not n:
                 return False
             s = await self.st()
+            if s.get("battle") or s.get("dlg") or s.get("menus"):
+                return False                   # something else needs handling first
             f = s.get("focus") or {}
             if f.get("k") == "npc" and f.get("id") == npc_id:
                 return True
+            if not n.get("shown") and n["d"] < 30:
+                # near enough to be drawn but hidden: asleep / indoors by their daily schedule
+                log.info("NPC %s is not out right now (hour %.1f)", npc_id, s.get("hour") or -1)
+                return False
+            tries += 1
+            if tries > 12:
+                return False
             if n["d"] > 2.0:
-                await self.walk_to(n["x"], n["z"], near=1.8, timeout=min(120, t_end - time.time()))
+                # long trips (across the sea) get time in proportion to the distance
+                budget = max(120, n["d"] * 3)
+                t_end = max(t_end, time.time() + budget)
+                if not await self.walk_to(n["x"], n["z"], near=1.8, timeout=min(budget, t_end - time.time())):
+                    await asyncio.sleep(0.5)
             else:
                 await self.face_xz(n["x"], n["z"])
                 await asyncio.sleep(0.3)
@@ -327,21 +443,24 @@ class Player:
                 await self.b.key("KeyW", False)
         return False
 
-    async def talk(self, npc_id, want=None, timeout=120):
+    async def talk(self, npc_id, goals=None, want=None, timeout=120):
         """Talk to an NPC and run the whole conversation.
-        `want`: words for the answer we came for (e.g. ["heal"]). It is picked once; after that,
-        or when nothing matches, the bot says goodbye. Returns the transcript."""
+        `goals`: game dialogue actions to aim for, in order (e.g. ["heal"], ["battle:fern"]).
+        Handing in ("turnIn:") and taking quests ("giveQuest:") are always wanted.
+        `want`: label words, only used if the dialogue graph cannot be read."""
         if not await self.go_to_npc(npc_id):
             return None
         await self.interact()
-        return await self.run_dialogue(want=want, timeout=timeout)
+        return await self.run_dialogue(goals=goals, want=want, timeout=timeout)
 
-    async def run_dialogue(self, want=None, timeout=90):
+    async def run_dialogue(self, goals=None, want=None, timeout=90):
         transcript = []
         t_end = time.time() + timeout
         idle = 0
         want = [w.lower() for w in (want or [])]
         used_want = False
+        goals = list(goals or []) + ["turnIn:", "giveQuest:"]
+        used = set()          # (node, label) already answered: never loop on the same answer
         while time.time() < t_end:
             s = await self.st()
             d = s.get("dlg")
@@ -366,14 +485,48 @@ class Player:
             if d["choices"]:
                 ch = d["choices"]
                 enabled = [i for i, c in enumerate(ch) if not c["off"]]
-                match = [i for i in enabled if any(w in ch[i]["label"].lower() for w in want)]
-                if match and not used_want:
-                    idx = match[0]
-                    used_want = True
-                elif len(enabled) == 1:
-                    idx = enabled[0]           # only one answer: it just moves the talk on
-                else:
-                    idx = leave_choice(ch)
+                plan = await self.js("__pkbot.dlgPlan()")
+                idx = None
+                why = ""
+                if plan and plan.get("node") and len(plan["choices"]) == len(ch):
+                    node = plan["node"]
+                    pc = plan["choices"]
+                    for goal in goals:
+                        best = None
+                        for i in enabled:
+                            if (node, pc[i]["label"]) in used:
+                                continue
+                            if any(a.startswith(goal) for a in pc[i]["acts"]):
+                                dist = 0
+                            else:
+                                ds = [d for a, d in pc[i]["reach"].items() if a.startswith(goal)]
+                                if not ds or pc[i]["risky"]:
+                                    continue
+                                dist = min(ds)
+                            if best is None or dist < best[0]:
+                                best = (dist, i)
+                        if best:
+                            idx, why = best[1], f"{goal} in {best[0]} step(s)"
+                            break
+                    if idx is None:
+                        ends = [i for i in enabled if pc[i]["ends"] and not pc[i]["acts"]]
+                        safe = [i for i in enabled if not pc[i]["risky"]]
+                        if ends:
+                            idx, why = ends[-1], "ends talk"
+                        elif safe:
+                            idx, why = leave_choice([ch[i] for i in safe]), "leave (safe)"
+                            idx = safe[idx] if idx < len(safe) else safe[-1]
+                    if idx is not None:
+                        used.add((node, pc[idx]["label"]))
+                if idx is None:
+                    match = [i for i in enabled if any(w in ch[i]["label"].lower() for w in want)]
+                    if match and not used_want:
+                        idx, why, used_want = match[0], "label match", True
+                    elif len(enabled) == 1:
+                        idx, why = enabled[0], "only answer"
+                    else:
+                        idx, why = leave_choice(ch), "leave"
+                log.info("DLG why: %s", why)
                 transcript.append(f"  -> {d['choices'][idx]['label']}")
                 log.info("DLG choose %s  (of %s)", d["choices"][idx]["label"],
                          [c["label"] + (" [off]" if c["off"] else "") for c in d["choices"]])

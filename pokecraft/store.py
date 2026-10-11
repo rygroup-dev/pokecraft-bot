@@ -19,6 +19,7 @@ DEFAULTS = {
     "notify_rare": True,
     "game_on": True,            # phase B: play the real game in a browser
     "game_headless": False,     # True on a VPS without a screen
+    "game_hidden": False,       # game window moved off-screen (keeps running, PC stays usable)
     "dash_msg": None,           # [chat_id, message_id] of the pinned dashboard
 }
 

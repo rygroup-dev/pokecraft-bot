@@ -25,8 +25,17 @@ if not exist ".env" (
     exit /b 1
 )
 
-echo [run] Pokecraft bot jalan... (Ctrl+C untuk berhenti)
+:loop
+echo [run] Pokecraft bot jalan... (stop.bat untuk berhenti rapi)
 "%PY%" main.py
+REM 0 = stopped on purpose, 3 = another bot already runs on this PC: do not restart
+if %errorlevel%==0 goto :end
+if %errorlevel%==3 goto :end
+echo [restart] Bot keluar karena error (kode %errorlevel%), jalan lagi 15 detik lagi. Log: logs\bot.log
+timeout /t 15 /nobreak >nul
+goto :loop
+
+:end
 echo.
 echo [stopped] Bot berhenti. Log: logs\bot.log
 pause

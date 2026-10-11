@@ -26,5 +26,14 @@ if [ ! -f .env ]; then
   exit 1
 fi
 
-echo "[run] Pokecraft bot jalan... (Ctrl+C untuk berhenti)"
-exec .venv/bin/python main.py
+while true; do
+  echo "[run] Pokecraft bot jalan... (./stop.sh untuk berhenti rapi)"
+  set +e
+  .venv/bin/python main.py
+  code=$?
+  set -e
+  # 0 = stopped on purpose, 3 = another bot already runs on this machine: do not restart
+  if [ "$code" = "0" ] || [ "$code" = "3" ]; then break; fi
+  echo "[restart] Bot keluar karena error (kode $code), jalan lagi 15 detik lagi. Log: logs/bot.log"
+  sleep 15
+done

@@ -101,7 +101,9 @@ class TelegramUI:
         await self.notify("🤖 <b>Pokecraft bot aktif.</b>\nKetik /menu untuk membuka dashboard.")
 
     def run(self):
-        self.app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+        # bootstrap_retries=-1: keep retrying when Telegram is briefly unreachable at start-up
+        self.app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True,
+                             bootstrap_retries=-1)
 
     async def notify(self, text):
         await self.app.bot.send_message(self.owner, text, parse_mode=ParseMode.HTML,
@@ -331,6 +333,9 @@ class TelegramUI:
             if arg == "stop":
                 await e.game.stop()
                 return "⏹ Game dihentikan", "game", None
+            if arg in ("hide", "show"):
+                await e.game.set_hidden(arg == "hide")
+                return ("🙈 Jendela disembunyikan, game tetap jalan" if arg == "hide" else "👀 Jendela ditampilkan"), "game", None
             if arg == "shot":
                 path = os.path.join(os.path.dirname(e.store.path), "shot.png")
                 if await e.game.screenshot(path):
@@ -478,7 +483,12 @@ class TelegramUI:
                     lines.append(f"• {esc(k)}: {esc(v)}")
         btn = (B("⏹ Stop main", callback_data="game:stop") if g.running
                else B("▶️ Mulai main", callback_data="game:start"))
+        hid = self.e.store.get("game_hidden")
+        lines += ["", f"🪟 Jendela game: <b>{'disembunyikan (tetap jalan)' if hid else 'tampil'}</b>",
+                  "<i>Jangan minimize jendela game: game berhenti. Pakai tombol sembunyikan.</i>"]
         return "\n".join(lines), kb([[btn, B("📸 Screenshot", callback_data="game:shot")],
+                                     [B("👀 Tampilkan jendela" if hid else "🙈 Sembunyikan jendela",
+                                        callback_data="game:show" if hid else "game:hide")],
                                      [B("🔄 Refresh", callback_data="nav:game")], back()])
 
     async def scr_farm(self, _=None):

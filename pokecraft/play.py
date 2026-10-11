@@ -111,15 +111,28 @@ class GameRunner:
                 self.e.event("🎮 Game dibuka, bot mulai main")
                 fails = 0
                 brain_task = asyncio.create_task(self.brain.run(self._stop))
-                while not self._stop.is_set() and not brain_task.done():
-                    await asyncio.sleep(15)
-                    if not self.browser.alive:
-                        raise RuntimeError("browser tertutup")
+                if self.e.store.get("game_hidden"):
+                    await self.browser.set_hidden(True)
+                try:
+                    while not self._stop.is_set() and not brain_task.done():
+                        await asyncio.sleep(15)
+                        if not self.browser.alive:
+                            raise RuntimeError("browser tertutup")
+                        if await self.browser.ensure_not_minimized():
+                            # minimized = the game stops drawing and freezes mid-battle
+                            self.e.event("🪟 Jendela game di-minimize, dipulihkan otomatis")
+                            await self.e.say("🪟 Jendela game jangan di-minimize (game jadi berhenti).\n"
+                                             "Pakai tombol <b>🙈 Sembunyikan</b> di menu 🎮 Game kalau mau disembunyikan.")
+                        try:
+                            self.last = await asyncio.wait_for(self.player.st(), 20)
+                        except Exception as ex:  # noqa: BLE001
+                            raise RuntimeError(f"game tidak merespons: {ex}") from ex
+                finally:
+                    brain_task.cancel()
                     try:
-                        self.last = await asyncio.wait_for(self.player.st(), 20)
-                    except Exception as ex:  # noqa: BLE001
-                        raise RuntimeError(f"game tidak merespons: {ex}") from ex
-                brain_task.cancel()
+                        await brain_task
+                    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                        pass
             except asyncio.CancelledError:
                 raise
             except Exception as ex:  # noqa: BLE001
@@ -130,6 +143,11 @@ class GameRunner:
                 await self._close()
                 await asyncio.sleep(min(600, 30 * fails))
         await self._close()
+
+    async def set_hidden(self, hidden):
+        self.e.store.set("game_hidden", bool(hidden))
+        if self.browser and self.browser.alive:
+            await self.browser.set_hidden(bool(hidden))
 
     async def screenshot(self, path):
         if not self.browser or not self.browser.alive:
