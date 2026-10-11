@@ -1,0 +1,5 @@
+python-telegram-bot==22.8
+httpx==0.28.1
+python-dotenv==1.2.4
+truststore==0.10.4
+base58==2.1.1

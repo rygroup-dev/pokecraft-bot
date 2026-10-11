@@ -1,0 +1,19 @@
+# secrets
+.env
+*.pem
+*.key
+id.json
+wallet*.json
+# runtime / generated
+.runtime/
+.venv/
+logs/
+data/
+__pycache__/
+*.pyc
+# research material, never publish
+*.har
+*.har.*
+audit*/
+*audit*
+dump/
