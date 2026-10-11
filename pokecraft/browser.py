@@ -26,7 +26,7 @@ SITE = "https://pokecraft.cartridgepad.fun/"
 HOOKS = [
     # handle to the game object as soon as the title screen is ready
     # plus the read-only data tables (blocks, species, moves, items, places, shops, recipes, quests)
-    ("this.pendingSave=l,", "window.__pk=this,window.__pkx=(()=>{try{return{F,Du,rv,nv,Ag,Kh,ew,kS,aC,o_,jg,sg,z1,_h}}"
+    ("this.pendingSave=l,", "window.__pk=this,window.__pkx=(()=>{try{return{F,Du,rv,nv,Ag,Kh,ew,kS,aC,o_,jg,sg,z1,_h,tg}}"
                             "catch(e){return{err:String(e)}}})(),this.pendingSave=l,"),
     ("async beginSession(e,t){", "async beginSession(e,t){window.__pk=this;"),
 ]

@@ -109,6 +109,8 @@ class Brain:
             return
         if await self.take_offers(s):
             return
+        if await self.notice_board(s):
+            return
         if await self.quests(s):
             return
         if await self.journey(s):
@@ -219,15 +221,40 @@ class Brain:
         return await self.p.walk_to(46, 72, near=4, timeout=300)
 
     def _seed_for(self, s, crop=None):
-        seeds = [x for x in s["inv"] if x["id"].endswith("_seed") and x["i"] < 9]
+        seeds = [x for x in s["inv"] if x["id"].endswith("_seed")]
         if crop:
             seeds = [x for x in seeds if x["id"] == f"{crop}_seed"]
         return max(seeds, key=lambda x: x["n"])["id"] if seeds else None
 
+    async def buy_item(self, item, n):
+        """Buy n of an item at Tilly's store (shop > Buy tab > row > Buy)."""
+        if not await self.npc_out("tilly"):
+            return False
+        self.act(f"buy {n}x {item} at Tilly")
+        await self.p.talk("tilly", goals=["openShop"])
+        await asyncio.sleep(1.0)
+        await self.p.click_button(fid="tab-buy", wait=0.6)
+        if not await self.p.click_button(fid="row-" + item, wait=0.5):
+            await self.p.close_menus()
+            self.skipped[item] = "tidak dijual di toko Tilly"
+            return False
+        before = sum(x["n"] for x in (await self.p.st())["inv"] if x["id"] == item)
+        for _ in range(n):
+            if not await self.p.click_button(fid="act-go", wait=0.5):
+                break
+        await self.p.close_menus()
+        after = sum(x["n"] for x in (await self.p.st())["inv"] if x["id"] == item)
+        return after > before
+
     async def do_plant(self, s, n, crop=None):
         seed = self._seed_for(s, crop)
+        if not seed and crop:
+            # the crop's seed is not in the bag: buy it at Tilly's (she sells seeds)
+            if await self.buy_item(f"{crop}_seed", max(n, 4)):
+                s = await self.p.st()
+                seed = next((x["id"] for x in s["inv"] if x["id"] == f"{crop}_seed"), None)
         if not seed:
-            self.skipped["plant"] = "tidak ada benih di hotbar"
+            self.skipped["plant"] = f"tidak ada benih {crop or ''}".strip()
             return False
         empty = await self.p.js("__pkbot.farmland(4)")
         if len([c for c in empty if 0.6 <= c["d"] <= 3.2]) < min(n, 4):
@@ -258,6 +285,43 @@ class Brain:
                 await self.p.water_crops()
         self.act(f"crops growing ({len(crops)}), doing other things meanwhile")
         return "wait"
+
+    async def place_specific(self, block, n):
+        """Place n blocks of a given block id (quest: '8 planks for the seat', '6 lanterns').
+        Uses a bag item that places that block; saws logs into planks when planks are short.
+        Returns None when the bot has no way to get that block."""
+        s = await self.p.st()
+        item = None
+        for x in s["inv"]:
+            if await self.p.js(f"__pkbot.blockOf('{x['id']}')") == block:
+                item = x
+                break
+        planks = await self.p.js("__pkx.F.Planks")
+        if (not item or item["n"] < n) and block == planks:
+            logs = sum(x["n"] for x in s["inv"] if x["id"] in ("oak_log", "birch_log"))
+            if logs:
+                self.act("saw logs into planks for building")
+                await self.p.b.tap("KeyI")
+                await asyncio.sleep(1)
+                await self.p.click_button(fid="tab-craft", wait=0.8)
+                for _ in range(min(3, logs)):
+                    rec = "cr-planks_oak" if any(x["id"] == "oak_log" for x in (await self.p.st())["inv"]) else "cr-planks_birch"
+                    await self.p.click_button(fid=rec, wait=0.4)
+                    await self.p.click_button(fid="cr-go", wait=0.6)
+                await self.p.close_menus()
+                s = await self.p.st()
+                item = next((x for x in s["inv"] if x["id"] == "blk_planks"), None)
+        if not item:
+            name = await self.p.js(f"__pkbot.blockName({block})")
+            self.skipped[f"block {name}"] = "tidak punya blok ini (belum bisa dibuat)"
+            return None
+        if len(await self.p.js("__pkbot.placeSpots(3)")) < min(n, 3):
+            spot = await self.p.js("__pkbot.findTillSpot(60, 6)")
+            if not spot or not await self.p.walk_to(spot["x"], spot["z"], near=1.2, timeout=120):
+                return False
+        got = await self.p.place_blocks(item["id"], min(n, item["n"]))
+        self.act(f"placed {got} {item['id']}")
+        return got > 0
 
     async def donate_museum(self, n):
         """Give museum pieces (fish, bugs, shells, fossils...) to Ferris; catch some first if
@@ -307,10 +371,11 @@ class Brain:
                     await self.p.gather(it, n)
                     break
             return True
-        if not await self.npc_out("tilly"):
+        shop = await self.nearest_shop()
+        if not shop:
             return False
-        self.act(f"sell {n} item(s) at Tilly for a quest")
-        await self.p.talk("tilly", goals=["openShop"])
+        self.act(f"sell {n} item(s) at {shop['name']} for a quest")
+        await self.p.talk(shop["id"], goals=["openShop"])
         await asyncio.sleep(1.0)
         await self.p.click_button(fid="tab-sell", wait=0.8)
         sold = 0
@@ -398,6 +463,46 @@ class Brain:
             await self.p.walk_to(pt[0], pt[1], near=3, timeout=60)
         else:
             await asyncio.sleep(5)
+        return True
+
+    async def notice_board(self, s):
+        """Daily jobs on the village notice board: hand in the ready ones and take new ones
+        (E on the board > pick the job; the game accepts or hands it in)."""
+        jobs = await self.p.js("__pkbot.boardInfo()")
+        ready = [j for j in jobs if j["phase"] == "ready"]
+        active = [q for q in s["quests"] if q["id"].startswith("daily_") and q["phase"] == "active"]
+        new = [j for j in jobs if j["phase"] == "none" and self._fail.get("board:" + j["id"], 0) < 2]
+        job = ready[0] if ready else (new[0] if new and len(active) < 3 else None)
+        if not job:
+            return False
+        board = next(iter(await self.p.js("__pkbot.props('board')")), None)
+        if not board:
+            return False
+        self.act(f"notice board: {'hand in' if job['phase'] == 'ready' else 'take'} '{job['title']}'")
+        if not await self.p.approach_prop(board):
+            self._fail["board:" + job["id"]] = self._fail.get("board:" + job["id"], 0) + 1
+            return True
+        await self.p.interact()
+        await asyncio.sleep(1.0)
+        st = await self.p.st()
+        # only pick a number when the board's own list is open (not a talk with someone else)
+        if st.get("dlg"):
+            await self.p.run_dialogue(timeout=20)
+        elif any("choose" in l or "modal" in l for l in st.get("layers", [])):
+            jobs2 = await self.p.js("__pkbot.boardInfo()")
+            idx = next((j["i"] for j in jobs2 if j["id"] == job["id"]), None)
+            if idx is not None:
+                await self.p.b.tap(f"Digit{idx + 1}")
+                await asyncio.sleep(1.0)
+        await self.p.close_menus()
+        after = next((j for j in await self.p.js("__pkbot.boardInfo()") if j["id"] == job["id"]), None)
+        if after and after["phase"] == job["phase"]:
+            self._fail["board:" + job["id"]] = self._fail.get("board:" + job["id"], 0) + 1
+        elif job["phase"] == "ready":
+            self.stats["quests"] += 1
+            await self.say(f"📌 Daily selesai: <b>{job['title']}</b>")
+        else:
+            await self.say(f"📌 Daily diambil: <b>{job['title']}</b>")
         return True
 
     async def take_offers(self, s, radius=200):
@@ -511,13 +616,14 @@ class Brain:
             if d.get("sell") is None or (not crop and (d.get("treat") or d.get("heal") or d.get("kind") in ("food", "tool", "seed"))):
                 continue
             sell.append(x["id"])
-        if not sell or not await self.npc_out("tilly"):
+        shop = await self.nearest_shop() if sell else None
+        if not shop:
             if museum and await self.npc_out("ferris"):
                 return await self.donate_museum(len(museum))
-            log.info("bag full (%d free): nothing to sell or Tilly/Ferris not out", free)
+            log.info("bag full (%d free): nothing to sell or no shopkeeper/Ferris out", free)
             return False
-        self.act(f"bag full ({free} free): selling {len(sell)} kinds at Tilly")
-        await self.p.talk("tilly", goals=["openShop"])
+        self.act(f"bag full ({free} free): selling {len(sell)} kinds at {shop['name']}")
+        await self.p.talk(shop["id"], goals=["openShop"])
         await asyncio.sleep(1.0)
         st = await self.p.st()
         if not any("shop" in l for l in st.get("layers", [])):
@@ -536,6 +642,13 @@ class Brain:
         await self.say(f"🛍 Tas penuh, jual {sold} jenis barang ke Tilly (gold {s.get('gems')} → {after.get('gems')})")
         return True
 
+    async def nearest_shop(self):
+        """Nearest shopkeeper who is out right now (any shop counts for selling quests)."""
+        for n in await self.p.js("__pkbot.shopNpcs()"):
+            if n.get("state") != "inside":
+                return n
+        return None
+
     async def npc_out(self, npc_id):
         """False when the NPC is in its home spot but not drawn: asleep / indoors (its schedule).
         Uses the game's own schedule state when the NPC is far away and not rendered."""
@@ -551,7 +664,7 @@ class Brain:
             giver = q.get("turnInTo") if q.get("turnInTo") not in (None, "anywhere") else q.get("giver")
             if not giver or ":" in giver and giver.startswith("vlg:"):
                 pass
-            if not giver or giver == "anywhere":
+            if not giver or giver in ("anywhere", "board"):     # board jobs: notice_board()
                 continue
             key = "turnin:" + q["id"]
             self._current_key = key
@@ -862,6 +975,12 @@ class Brain:
                     need = (o.get("n") or 1) - have_now
                     if need <= 0:
                         ok = True          # already in the bag; the quest turns ready on its own
+                    elif (await self.p.js(f"__pkbot.itemDef('{o['item']}')") or {}).get("kind") == "crop":
+                        # a harvest item (wheat, pumpkin ...): grow it
+                        res = await self.do_harvest(s, need, crop=o["item"])
+                        if res == "wait":
+                            continue
+                        ok = res
                     elif o["item"] in ("old_boot", "pebble", "clay_pot"):
                         # fishing junk (game: 10% of bites are junk, 45% of those an old boot)
                         ok = await self.go_fish(15, want_item=o["item"]) > 0
@@ -900,6 +1019,11 @@ class Brain:
                     if res == "wait":
                         continue               # crops still growing: do something else meanwhile
                     ok = res
+                elif kind == "place" and o.get("block"):
+                    ok = await self.place_specific(o["block"], left)
+                    if ok is None:
+                        self._fail[key] = 99
+                        continue
                 elif kind == "place" and not o.get("block"):
                     # any placement counts (game emits "place" for tilled farmland too)
                     ok = await self.till_somewhere(min(left, 12))

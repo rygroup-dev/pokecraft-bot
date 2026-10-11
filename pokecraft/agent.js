@@ -3,7 +3,7 @@
 (() => {
   const G = () => window.__pk;
   const X = () => window.__pkx || {};
-  const B = { ver: 16 };
+  const B = { ver: 21 };
 
   B.blockName = (id) => { const d = X().Du && X().Du[id]; return d ? d.name : String(id); };
   B.blockIds = (re) => {
@@ -57,6 +57,7 @@
                  objs: (q.objectives || []).map((o, i) => ({ kind: o.kind, n: o.n, item: o.item, alt: o.alt,
                    npc: o.npc, place: o.place, fish: o.fish, species: o.species, what: o.what,
                    emote: o.emote, block: o.block, trainer: o.trainer, consume: !!o.consume,
+                   crop: o.crop, bug: o.bug, near: o.near,
                    have: st && st.progress ? st.progress[i] : 0 })) };
       });
     } catch (e) { out.quests = []; }
@@ -135,6 +136,21 @@
     return g.digSpots.spots.filter((s) => g.digSpots.isActive(s, now))
       .map((s) => ({ i: s.i, x: s.x + 0.5, y: s.y, z: s.z + 0.5, d: Math.hypot(s.x + 0.5 - p.x, s.z + 0.5 - p.z) }))
       .filter((s) => s.d <= r).sort((a, b) => a.d - b.d).slice(0, 10);
+  };
+  // Shopkeepers (NPCs whose talk has an openShop action), nearest first, with their state.
+  B.shopNpcs = () => {
+    const g = G(); const p = g.player.pos; const out = [];
+    for (const a of g.npcs.actors) {
+      let shop = null;
+      for (const n of a.def.nodes || []) {
+        const all = [].concat(n.action || [], ...(n.choices || []).map((c) => [].concat(c.action || [])));
+        const s = all.find((x) => x && x.do === 'openShop');
+        if (s) { shop = s.shop; break; }
+      }
+      if (shop) out.push({ id: a.def.id, name: a.def.name, shop, state: typeof a.state === 'string' ? a.state : null,
+                           d: Math.hypot(a.pos.x - p.x, a.pos.z - p.z) });
+    }
+    return out.sort((a, b) => a.d - b.d);
   };
   // NPC whose talk can start a given battle (dialogue action battle:<trainer>).
   B.battleNpc = (trainer) => {
@@ -379,6 +395,23 @@
                      d: Math.hypot(c.pos.x - p.x, c.pos.z - p.z), kind: c.kind || '' }))
       .filter((c) => c.d <= r).sort((a, b) => a.d - b.d);
   };
+  // Block id an item places (game tg), 0 when the item is not a block.
+  B.blockOf = (item) => { try { return X().tg ? X().tg(item) : 0; } catch (e) { return 0; } };
+  // Open ground cells around us where a block can sit on top (solid top, air above, not protected).
+  B.placeSpots = (r) => {
+    const g = G(); const p = g.player.pos; const out = []; r = r || 3;
+    const px = Math.floor(p.x), pz = Math.floor(p.z), py = Math.floor(p.y);
+    for (let x = px - r; x <= px + r; x++) for (let z = pz - r; z <= pz + r; z++) {
+      if (x === px && z === pz) continue;
+      if (g.build.isProtected(x, z)) continue;
+      for (let y = py - 1; y >= py - 2; y--) {
+        if (W().get(x, y, z) !== 0 && W().get(x, y + 1, z) === 0 && W().get(x, y + 2, z) === 0) {
+          out.push({ x, y, z, d: Math.hypot(x + 0.5 - p.x, z + 0.5 - p.z) }); break;
+        }
+      }
+    }
+    return out.filter((c) => c.d >= 1.4 && c.d <= 3.2).sort((a, b) => a.d - b.d);
+  };
   // Item definition facts the bag manager needs (game item table).
   B.itemDef = (id) => { try { const d = X().Ag(id); return d ? { id, kind: d.kind, sell: d.sell ?? null, museum: !!d.museum,
     treat: d.treat ?? null, heal: d.heal ?? null, name: d.name } : null; } catch (e) { return null; } };
@@ -389,7 +422,7 @@
   // table Kh; in this game version the mainland villages/caves/snow are missing from it.
   B.discoverable = (id) => !!(X().Kh && X().Kh[id]);
   B.places = () => G().world.places.map((pl) => ({ id: pl.id, name: (X().Kh && X().Kh[pl.id] && X().Kh[pl.id].name) || pl.name, x: pl.x, z: pl.z }));
-  B.props = () => { const g = G(); const p = g.player.pos; return g.props.interactables().map((i) => ({ kind: i.kind, id: i.id, x: i.x, y: i.y, z: i.z, d: Math.hypot(i.x - p.x, i.z - p.z) })).sort((a, b) => a.d - b.d).slice(0, 30); };
+  B.props = (kind) => { const g = G(); const p = g.player.pos; return g.props.interactables().filter((i) => !kind || i.kind === kind).map((i) => ({ kind: i.kind, id: i.id, x: i.x, y: i.y, z: i.z, d: Math.hypot(i.x - p.x, i.z - p.z) })).sort((a, b) => a.d - b.d).slice(0, 30); };
   B.buddy = () => { const b = G().creatures.buddy; return b ? { x: b.pos.x, y: b.pos.y, z: b.pos.z } : null; };
 
   // camera ray (origin + direction) so the bot can aim like a player
@@ -408,6 +441,8 @@
     }
     return out.sort((a, b) => a.d - b.d);
   };
+  // The notice board's current jobs in the order the board lists them, with their phase.
+  B.boardInfo = () => { try { const q = G().quests; return q.boardQuests().map((d, i) => ({ i, id: d.id, title: d.title, phase: q.phase(d.id) })); } catch (e) { return []; } };
   B.boardOffers = () => { try { return (G().quests.available('board') || []).map((q) => ({ id: q.id, title: q.title, kinds: (q.objectives || []).map((o) => o.kind) })); } catch (e) { return []; } };
 
   // ------------------------------------------------------------------ dialogue graph

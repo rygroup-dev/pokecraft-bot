@@ -265,11 +265,17 @@ class Player:
 
     # ------------------------------------------------------------------ acting
     async def select_item(self, item_id):
-        """Put an item from the hotbar (slots 1-9) in hand. Returns False if not in the hotbar."""
+        """Put an item in hand. Items outside the hotbar are moved there first (Bag > To hotbar).
+        Returns False when the bag does not have it."""
         s = await self.st()
         slot = next((x["i"] for x in s["inv"] if x["id"] == item_id and x["i"] < 9), None)
         if slot is None:
-            return False
+            if not any(x["id"] == item_id for x in s["inv"]) or not await self.to_hotbar(item_id):
+                return False
+            s = await self.st()
+            slot = next((x["i"] for x in s["inv"] if x["id"] == item_id and x["i"] < 9), None)
+            if slot is None:
+                return False
         if s["sel"] != slot:
             await self.b.tap(f"Digit{slot + 1}")
             await asyncio.sleep(0.15)
@@ -303,7 +309,9 @@ class Player:
     async def till(self, n):
         """Till up to n patches of grass/dirt around us with the hoe (game farm.till).
         Returns how many patches became Farmland."""
-        if not await self.select_item("hoe") and not await self.select_item("wooden_hoe"):
+        s = await self.st()
+        hoes = [h for h in ("iron_hoe", "stone_hoe", "wooden_hoe", "hoe") if any(x["id"] == h for x in s["inv"])]
+        if not hoes or not await self.select_item(hoes[0]):
             return 0
         done = 0
         for c in (await self.js("__pkbot.tillable(4)"))[: n + 4]:
@@ -440,7 +448,9 @@ class Player:
     async def dig_once(self):
         """Dig the nearest active dig spot with the shovel (game: click with the shovel within
         2.4 m of a sparkling spot). Returns True when the game counted a dig."""
-        if not await self.select_item("shovel") and not await self.select_item("wooden_shovel"):
+        s = await self.st()
+        shovels = [h for h in ("iron_shovel", "stone_shovel", "wooden_shovel", "shovel") if any(x["id"] == h for x in s["inv"])]
+        if not shovels or not await self.select_item(shovels[0]):
             return False
         spots = await self.js("__pkbot.digSpots(70)")
         if not spots:
@@ -453,6 +463,65 @@ class Player:
         await self.click_center_left()
         await asyncio.sleep(1.8)                 # digging takes ~1.1 s in the game
         return (await self.js("__pk.save.stats.dug")) > before
+
+    async def approach_prop(self, prop, timeout=200):
+        """Stand next to a prop (notice board, well ...) so the game focuses the prop itself.
+        NPCs within 2.4 m win the focus over props, so pick a side of the prop away from them."""
+        if not await self.walk_to(prop["x"], prop["z"], near=2.5, timeout=timeout):
+            return False
+        for _ in range(2):
+            npcs = [n for n in await self.js("__pkbot.npcs()") if n.get("shown")]
+            spots = []
+            for k in range(8):
+                a = k * math.pi / 4
+                sx, sz = prop["x"] + 1.0 * math.cos(a), prop["z"] + 1.0 * math.sin(a)
+                gap = min([math.hypot(n["x"] - sx, n["z"] - sz) for n in npcs] or [99])
+                spots.append((gap, sx, sz))
+            for gap, sx, sz in sorted(spots, reverse=True)[:4]:
+                if gap < 2.6:
+                    break
+                await self.walk_to(sx, sz, near=0.5, timeout=30)
+                await self.face_xz(prop["x"], prop["z"])
+                await asyncio.sleep(0.3)
+                f = (await self.st()).get("focus") or {}
+                if f.get("k") == "prop" and f.get("prop") == prop["kind"]:
+                    return True
+        return False
+
+    async def to_hotbar(self, item):
+        """Make sure an item sits in the hotbar (slots 1-9): Bag > slot > 'To hotbar'."""
+        s = await self.st()
+        x = next((x for x in s["inv"] if x["id"] == item), None)
+        if not x:
+            return False
+        if x["i"] < 9:
+            return True
+        await self.close_menus()
+        await self.b.tap("KeyI")
+        await asyncio.sleep(1.0)
+        ok = (await self.click_button(fid=f"slot-{x['i']}", wait=0.5) and
+              await self.click_button(fid="act-hot", wait=0.6))
+        await self.close_menus()
+        s = await self.st()
+        return ok and any(y["id"] == item and y["i"] < 9 for y in s["inv"])
+
+    async def place_blocks(self, item, n):
+        """Place up to n blocks of `item` on open ground around us (hold it, right click on the
+        top of a ground block). Returns how many were placed."""
+        block = await self.js(f"__pkbot.blockOf('{item}')")
+        if not block or not await self.to_hotbar(item) or not await self.select_item(item):
+            return 0
+        done = 0
+        for c in await self.js("__pkbot.placeSpots(3)"):
+            if done >= n:
+                break
+            if not await self.aim(c["x"], c["y"], c["z"]):
+                continue
+            await self.right_click()
+            await asyncio.sleep(0.35)
+            if await self.js(f"__pk.world.get({c['x']},{c['y'] + 1},{c['z']}) === {block}"):
+                done += 1
+        return done
 
     async def plant(self, seed, n):
         """Plant up to n seeds on empty farmland around us (hold the seed, right click)."""

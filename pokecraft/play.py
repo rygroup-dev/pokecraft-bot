@@ -61,13 +61,29 @@ class GameRunner:
         if self.player:
             self.player.pause_file = None          # closing must work even while paused
         if self.player and self.browser and self.browser.alive:
-            try:   # let the game write its online save first: pause menu > Save now
+            try:
+                # let the game write its online save first (pause menu > Save now). The game
+                # queues the online sync a few seconds later, so wait until the server's save
+                # revision actually moves before closing the window.
+                # Bag > Wallet > "Save progress online" syncs right away (pause-menu "Save now"
+                # only queues it). Then confirm on the server: its playtime must reach ours.
                 await self.player.close_menus()
-                await self.browser.tap("Escape")
-                await asyncio.sleep(0.8)
-                await self.player.click_button(text="Save now", wait=6)
-            except Exception:  # noqa: BLE001
-                pass
+                local = await self.player.js("__pk.save.stats.playSec")
+                await self.browser.tap("KeyI")
+                await asyncio.sleep(1.0)
+                clicked = (await self.player.click_button(fid="tab-wallet", wait=1.2) and
+                           await self.player.click_button(fid="save-online", wait=1.0))
+                srv = None
+                for _ in range(20):
+                    srv = (await self.e.api.get_save()).get("save", {}).get("stats", {}).get("playSec")
+                    if srv is not None and srv >= local - 2:
+                        break
+                    await asyncio.sleep(1)
+                log.info("save before close: clicked=%s local playSec %.0f, server %.0f -> %s", clicked,
+                         local or -1, srv or -1, "OK" if srv is not None and srv >= local - 2 else "NOT SYNCED")
+                await self.player.close_menus()
+            except Exception as ex:  # noqa: BLE001
+                log.warning("save before close failed: %s", ex)
         if self.browser:
             try:
                 await self.browser.close()
