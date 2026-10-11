@@ -83,10 +83,9 @@ def main():
             await asyncio.sleep(2)
         os.remove(stop_flag)
         logging.getLogger("main").info("STOP requested via stop.flag")
+        await engine.stop()                  # API side first: it must not touch the save meanwhile
         if engine.game and engine.game.running:
-            await engine.game.stop()
-            store.set("game_on", True)       # stop.flag is a restart, not "turn the game off"
-        await engine.stop()
+            await engine.game.stop(keep_setting=True)   # stop.flag is a restart, not "game off"
         for t in engine._tasks:
             try:
                 await t

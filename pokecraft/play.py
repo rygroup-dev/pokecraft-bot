@@ -44,8 +44,9 @@ class GameRunner:
         self.task = asyncio.create_task(self._run(), name="game")
         self.e.store.set("game_on", True)
 
-    async def stop(self):
-        self.e.store.set("game_on", False)
+    async def stop(self, keep_setting=False):
+        if not keep_setting:
+            self.e.store.set("game_on", False)
         self._stop.set()
         if self.task:
             self.task.cancel()

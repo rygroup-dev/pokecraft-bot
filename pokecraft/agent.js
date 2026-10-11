@@ -3,7 +3,7 @@
 (() => {
   const G = () => window.__pk;
   const X = () => window.__pkx || {};
-  const B = { ver: 9 };
+  const B = { ver: 15 };
 
   B.blockName = (id) => { const d = X().Du && X().Du[id]; return d ? d.name : String(id); };
   B.blockIds = (re) => {
@@ -61,6 +61,7 @@
       });
     } catch (e) { out.quests = []; }
     out.inv = s.inv.map((x, i) => (x ? { i, id: x.id, n: x.n } : null)).filter(Boolean);
+    out.invCap = s.inv.length;
     out.sel = s.sel; out.held = g.heldTool ? g.heldTool() : null;
     const z1 = X().z1;
     out.party = s.party.map((c) => ({ uid: c.uid, species: c.species, level: c.level, hp: c.hp,
@@ -128,6 +129,69 @@
     }
     return out.sort((a, b) => a.d - b.d).slice(0, 40);
   };
+  // Bugs flying around (game bugs.live), nearest first.
+  B.bugs = (r) => {
+    const g = G(); const p = g.player.pos; r = r || 50;
+    return g.bugs.live.filter((b) => !b.leaving && b.alpha >= 0.4)
+      .map((b) => ({ id: b.def.id, h: b.handle, x: b.x, y: b.y, z: b.z, d: Math.hypot(b.x - p.x, b.z - p.z) }))
+      .filter((b) => b.d <= r).sort((a, b) => a.d - b.d);
+  };
+
+  // Would a net swing catch something right now? Same check as the game's swingNet: bugs within
+  // 3 m of the point 1.6 m in front of the body (player.forward, not the camera) at chest height.
+  B.netReach = () => {
+    const p = G().player; const f = p.forward();
+    return G().bugs.nearby(p.pos.x + f.x * 1.6, p.pos.y + 1, p.pos.z + f.z * 1.6, 3).length;
+  };
+
+  // Fishing state as the game holds it (state, reel marker phase/speed and the green zone).
+  B.fishState = () => {
+    const f = G().fishing; const r = f.reelObj;
+    return { state: f.state, phase: f.phase, speed: f.speed, zone: [r.zone[0], r.zone[1]], pos: r.pos,
+             hits: f.hits, misses: r.misses, msg: f.view.message, habitat: f.view.habitat, t: performance.now() };
+  };
+  // A dry standing spot near water: open water 5..9 blocks away in one of 8 directions.
+  B.fishSpot = (r) => {
+    const g = G(); const p = g.player.pos; r = r || 40;
+    const px = Math.floor(p.x), pz = Math.floor(p.z), py = Math.floor(p.y);
+    const deep = (x, z) => { const wl = B.waterLevel(x, z); if (wl <= 0) return false; return wl - W().groundBelow(x + 0.5, z + 0.5, Math.floor(wl) + 1) > 0.8; };
+    let best = null;
+    const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1], [0.71, 0.71], [0.71, -0.71], [-0.71, 0.71], [-0.71, -0.71]];
+    for (let x = px - r; x <= px + r; x += 1) for (let z = pz - r; z <= pz + r; z += 1) {
+      const d0 = Math.hypot(x - px, z - pz); if (d0 > r || (best && d0 >= best.d)) continue;
+      if (B.waterLevel(x, z) > 0 && deep(x, z)) continue;          // stand on dry ground
+      const sy = B.stand(x, z, py); if (sy === null) continue;
+      for (const [dx, dz] of dirs) {
+        let ok = true;
+        for (let k = 5; k <= 9; k++) if (!deep(Math.floor(x + dx * k), Math.floor(z + dz * k))) { ok = false; break; }
+        if (!ok) continue;
+        const wx = x + 0.5 + dx * 7, wz = z + 0.5 + dz * 7;
+        best = { x: x + 0.5, z: z + 0.5, y: sy, wx, wz, wy: B.waterLevel(Math.floor(wx), Math.floor(wz)), d: d0 };
+        break;
+      }
+    }
+    return best;
+  };
+
+  // Farming: empty farmland near the player, and our crops with their growth stage (>=3 ripe).
+  B.farmland = (r) => {
+    const g = G(); const p = g.player.pos; const out = []; r = r || 4;
+    const px = Math.floor(p.x), pz = Math.floor(p.z), py = Math.floor(p.y);
+    const FL = X().F ? X().F.Farmland : 26;
+    for (let x = px - r; x <= px + r; x++) for (let z = pz - r; z <= pz + r; z++)
+      for (let y = py - 2; y <= py; y++) {
+        if (W().get(x, y, z) !== FL) continue;
+        if (g.farm.cropOn(x, y, z)) continue;
+        out.push({ x, y, z, d: Math.hypot(x + 0.5 - p.x, z + 0.5 - p.z) });
+      }
+    return out.sort((a, b) => a.d - b.d);
+  };
+  B.crops = () => {
+    const g = G(); const p = g.player.pos; const now = Date.now();
+    return (g.save.crops || []).map((c) => ({ x: c.x, y: c.y, z: c.z, crop: c.crop,
+      stage: g.farm.stageOf(c, now), d: Math.hypot(c.x + 0.5 - p.x, c.z + 0.5 - p.z) })).sort((a, b) => a.d - b.d);
+  };
+
   // Nearest open ground (outside protected areas) with at least `need` tillable patches around it.
   B.findTillSpot = (r, need) => {
     const g = G(); const p = g.player.pos; const w = W();
@@ -280,6 +344,8 @@
     // all actors: far ones are just not rendered (visible=false) but they are there
     return g.npcs.actors.map((a) => ({
       id: a.def.id, name: a.def.name, title: a.def.title || '', trainer: !!a.def.trainer, shown: a.visible !== false,
+      state: typeof a.state === 'string' ? a.state : null,                 // "inside" = at home (schedule)
+      wake: a.sched && !a.sched.always ? a.sched.a : null,                 // hour the NPC comes out
       x: a.pos.x, y: a.pos.y, z: a.pos.z, d: Math.hypot(a.pos.x - p.x, a.pos.z - p.z),
     })).sort((a, b) => a.d - b.d);
   };
@@ -295,6 +361,9 @@
                      d: Math.hypot(c.pos.x - p.x, c.pos.z - p.z), kind: c.kind || '' }))
       .filter((c) => c.d <= r).sort((a, b) => a.d - b.d);
   };
+  // Item definition facts the bag manager needs (game item table).
+  B.itemDef = (id) => { try { const d = X().Ag(id); return d ? { id, kind: d.kind, sell: d.sell ?? null, museum: !!d.museum,
+    treat: d.treat ?? null, heal: d.heal ?? null, name: d.name } : null; } catch (e) { return null; } };
   // favourite treat per species (game table _h) and the treat value of an item
   B.favourite = (species) => (X()._h || {})[species] || null;
   B.treatValue = (item) => { try { const d = X().Ag(item); return d ? { kind: d.kind, treat: d.treat ?? null } : null; } catch (e) { return null; } };
@@ -357,7 +426,9 @@
     // conversation's root nodes (that is a loop back to the start) and does not walk through
     // choices with side effects (gift / photo / sleep / ferry / battle / shop).
     const roots = new Set((def.roots || []).map((r) => r.node));
-    const RISKY = /^(gift|photo|sleep|ferry|battle|openShop|openMuseum|openBox|openBank|openBounties|takeItem|gems)/;
+    // paying for what we came for (heal fee, quest items) is fine: the game disables a choice
+    // we cannot afford; scenes like gift/photo/sleep/ferry/battle/menus are only taken on purpose
+    const RISKY = /^(gift|photo|sleep|ferry|battle|openShop|openMuseum|openBox|openBank|openBounties)/;
     const reach = (start, maxDepth) => {
       const out = {}; const seen = new Set(); const q = [[start, 1]];
       while (q.length) {

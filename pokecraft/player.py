@@ -311,6 +311,173 @@ class Player:
                 done += 1
         return done
 
+    async def aim_point(self, tx, ty, tz, tries=4):
+        """Point the camera ray at a world point (e.g. a water surface)."""
+        for _ in range(tries):
+            r = await self.js("__pkbot.ray()")
+            ox, oy, oz = r["o"]
+            dx, dy, dz = r["d"]
+            vx, vy, vz = tx - ox, ty - oy, tz - oz
+            n = math.sqrt(vx * vx + vy * vy + vz * vz) or 1
+            vx, vy, vz = vx / n, vy / n, vz / n
+            dyaw = wrap(math.atan2(-vx, -vz) - math.atan2(-dx, -dz))
+            delev = math.asin(max(-1, min(1, vy))) - math.asin(max(-1, min(1, dy)))
+            if abs(dyaw) < 0.03 and abs(delev) < 0.03:
+                return True
+            await self.turn(dyaw, -delev)
+            await asyncio.sleep(0.12)
+        return True
+
+    async def fish_once(self, timeout=40):
+        """Cast, wait for the bite, then play the reel game by predicting when the marker
+        (0.5 + 0.5*sin(phase), moving at `speed` rad/s) is in the green zone.
+        Returns 'fish', 'junk', 'escaped' or None (could not cast)."""
+        fs = await self.js("__pkbot.fishState()")
+        if fs["state"] in ("caught", "escaped"):
+            await self.b.tap("KeyE")
+            await asyncio.sleep(0.5)
+        inv_before = {x["id"]: x["n"] for x in (await self.st())["inv"]}
+        await self.click_center_left()
+        await asyncio.sleep(0.4)
+        fs = await self.js("__pkbot.fishState()")
+        if fs["state"] not in ("casting", "waiting"):
+            return None
+        t_end = time.time() + timeout
+        # wait for a real bite
+        while time.time() < t_end:
+            fs = await self.js("__pkbot.fishState()")
+            if fs["state"] == "bite":
+                await self.b.tap("KeyE", 0.03)
+                await asyncio.sleep(0.15)
+                fs = await self.js("__pkbot.fishState()")
+                if fs["state"] == "reeling":
+                    break
+                if fs["state"] == "bite":           # a false nibble: pressing does nothing, keep waiting
+                    await asyncio.sleep(0.2)
+                    continue
+            if fs["state"] in ("escaped", "idle", "caught"):
+                break
+            await asyncio.sleep(0.08)
+        # reel: estimate the round-trip latency, then press when the marker will be centred
+        lat = 0.03
+        while time.time() < t_end:
+            t0 = time.perf_counter()
+            fs = await self.js("__pkbot.fishState()")
+            lat = 0.7 * lat + 0.3 * (time.perf_counter() - t0)
+            if fs["state"] != "reeling":
+                break
+            z0, z1 = fs["zone"]
+            zc = (z0 + z1) / 2
+            # phase values where the marker sits at the zone centre (two per cycle)
+            a = math.asin(max(-1, min(1, (zc - 0.5) / 0.5)))
+            ph = fs["phase"] % (2 * math.pi)
+            waits = []
+            for target in (a, math.pi - a):
+                d = (target - ph) % (2 * math.pi)
+                waits.append(d / max(0.5, fs["speed"]))
+            wait = min(w for w in waits if w > lat * 1.5) if any(w > lat * 1.5 for w in waits) else min(waits) + 2 * math.pi / fs["speed"]
+            await asyncio.sleep(max(0.0, wait - lat))
+            await self.b.tap("KeyE", 0.02)
+            await asyncio.sleep(0.12)
+        await asyncio.sleep(0.6)
+        fs = await self.js("__pkbot.fishState()")
+        inv_after = {x["id"]: x["n"] for x in (await self.st())["inv"]}
+        gained = [k for k, v in inv_after.items() if v > inv_before.get(k, 0)]
+        if fs["state"] in ("caught", "escaped"):
+            await self.b.tap("KeyE")
+        if not gained:
+            return "escaped"
+        return "junk" if any(g in ("old_boot", "pebble", "clay_pot") for g in gained) else "fish"
+
+    async def click_center_left(self):
+        cx, cy = self.b.size[0] // 2, self.b.size[1] // 2
+        await self.b.click(cx, cy)
+
+    async def catch_bug(self, timeout=60):
+        """Walk up to the nearest bug and swing the net when it is ~1.6 m in front
+        (game swingNet catches the closest bug within 3 m of that point)."""
+        if not await self.select_item("bug_net"):
+            return False
+        before = await self.js("__pk.save.stats.bugs")
+        t_end = time.time() + timeout
+        while time.time() < t_end:
+            bugs = await self.js("__pkbot.bugs(50)")
+            if not bugs:
+                return False
+            bug = bugs[0]
+            if bug["d"] > 3.0:
+                await self.walk_to(bug["x"], bug["z"], near=2.0, timeout=20, sprint=False)
+                continue
+            # the body (not the camera) must face the bug: face it, then nudge forward until the
+            # game's own reach check (bugs.nearby from the body's front) sees it
+            await self.face_xz(bug["x"], bug["z"], tol=0.15)
+            reach = 0
+            for _ in range(4):
+                await self.b.key("KeyW", True)
+                await asyncio.sleep(0.1)
+                await self.b.key("KeyW", False)
+                await asyncio.sleep(0.12)
+                reach = await self.js("__pkbot.netReach()")
+                if reach:
+                    break
+            if not reach:
+                continue
+            await self.click_center_left()
+            await asyncio.sleep(0.6)
+            if (await self.js("__pk.save.stats.bugs")) > before:
+                return True
+        return False
+
+    async def plant(self, seed, n):
+        """Plant up to n seeds on empty farmland around us (hold the seed, right click)."""
+        if not await self.select_item(seed):
+            return 0
+        done = 0
+        for c in await self.js("__pkbot.farmland(4)"):
+            if done >= n:
+                break
+            if c["d"] > 3.2 or c["d"] < 0.6:
+                continue
+            if not await self.aim(c["x"], c["y"], c["z"]):
+                continue
+            await self.right_click()
+            await asyncio.sleep(0.35)
+            if await self.js(f"!!__pk.farm.cropOn({c['x']},{c['y']},{c['z']})"):
+                done += 1
+        return done
+
+    async def water_crops(self):
+        """Water the crops around us (watered crops grow twice as fast)."""
+        if not await self.select_item("watering_can"):
+            return 0
+        done = 0
+        for c in await self.js("__pkbot.crops()"):
+            if c["d"] > 3.2 or c["stage"] >= 3:
+                continue
+            if await self.aim(c["x"], c["y"], c["z"]):
+                await self.right_click()
+                await asyncio.sleep(0.3)
+                done += 1
+        return done
+
+    async def harvest_ripe(self):
+        """Walk to ripe crops and press E on each (focus 'crop'). Returns how many were picked."""
+        got = 0
+        for c in [c for c in await self.js("__pkbot.crops()") if c["stage"] >= 3][:12]:
+            if c["d"] > 2.5:
+                if not await self.walk_to(c["x"] + 0.5, c["z"] + 0.5, near=1.6, timeout=60):
+                    continue
+            if not await self.aim(c["x"], c["y"], c["z"]):
+                continue
+            s = await self.st()
+            if (s.get("focus") or {}).get("k") != "crop":
+                continue
+            await self.interact()
+            await asyncio.sleep(0.4)
+            if not await self.js(f"!!__pk.farm.cropOn({c['x']},{c['y']},{c['z']})"):
+                got += 1
+        return got
+
     async def gather(self, item, n, radius=70, timeout=240):
         """Pick up n decorations that give `item` (walk next to each, press E when the game
         offers 'Pick up …'). Returns how many were picked."""
@@ -417,9 +584,9 @@ class Player:
             f = s.get("focus") or {}
             if f.get("k") == "npc" and f.get("id") == npc_id:
                 return True
-            if not n.get("shown") and n["d"] < 30:
-                # near enough to be drawn but hidden: asleep / indoors by their daily schedule
-                log.info("NPC %s is not out right now (hour %.1f)", npc_id, s.get("hour") or -1)
+            if n.get("state") == "inside":
+                # at home by the game's daily schedule (actor.state "inside"); comes out at `wake`
+                log.info("NPC %s is inside (hour %.1f, comes out at %s)", npc_id, s.get("hour") or -1, n.get("wake"))
                 return False
             tries += 1
             if tries > 12:
