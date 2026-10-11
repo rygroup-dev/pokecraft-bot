@@ -17,6 +17,8 @@ DEFAULTS = {
     "sell_min_price": 1.0,      # never list below this many POKECRAFT
     "sell_keep_rare": True,     # keep rare+ drops, sell commons only
     "notify_rare": True,
+    "game_on": True,            # phase B: play the real game in a browser
+    "game_headless": False,     # True on a VPS without a screen
     "dash_msg": None,           # [chat_id, message_id] of the pinned dashboard
 }
 

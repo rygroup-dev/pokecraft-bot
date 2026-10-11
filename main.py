@@ -17,6 +17,7 @@ from dotenv import load_dotenv  # noqa: E402
 from pokecraft.api import PokecraftApi, Wallet  # noqa: E402
 from pokecraft.chain import Chain  # noqa: E402
 from pokecraft.engine import Engine  # noqa: E402
+from pokecraft.play import GameRunner  # noqa: E402
 from pokecraft.store import Store  # noqa: E402
 from pokecraft.tg import TelegramUI  # noqa: E402
 
@@ -69,12 +70,15 @@ def main():
     store = Store(os.path.join(ROOT, "data", "state.json"))
     engine = Engine(PokecraftApi(wallet), store, Chain(os.getenv("SOLANA_RPC") or None),
                     ref_code=os.getenv("REF_CODE", "tcswarv7"))
+    engine.game = GameRunner(engine, os.path.join(ROOT, "data"))
     ui = TelegramUI(need("TELEGRAM_BOT_TOKEN"), owner, engine)
     orig = ui.app.post_init
 
     async def post_init(app):
         await orig(app)
         engine.start()
+        if store.get("game_on") and engine.game.available:
+            await engine.game.start()
     ui.app.post_init = post_init
     logging.getLogger("main").info("START wallet=%s", wallet.address)
     ui.run()

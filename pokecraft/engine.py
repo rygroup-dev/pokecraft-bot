@@ -51,6 +51,7 @@ class Engine:
         self.chain = chain
         self.ref_code = (ref_code or "").strip().lower() or None
         self.notify = None              # async callable(text) set by the Telegram layer
+        self.game = None                # GameRunner (phase B), set by main
         self.account = None             # /api/me
         self.save_info = {}             # summary of /api/save
         self.invites = None
@@ -148,8 +149,15 @@ class Engine:
         return keys[self.rotate_i]
 
     # ------------------------------------------------------------------ save safety
+    def game_owns_save(self):
+        """While phase B plays the game, the game client is the only writer of the save:
+        pouch gold and rewards move through its own Wallet/Invite pages."""
+        return self.game is not None and (self.game.running or bool(self.store.get("game_on")))
+
     def player_idle(self):
         """True when nobody played in the browser recently (save rev and playtime unchanged)."""
+        if self.game_owns_save():
+            return False
         mark = (self.save_info.get("rev"), self.save_info.get("play_sec"))
         now = time.time()
         if mark != getattr(self, "_save_mark", None):
@@ -235,6 +243,8 @@ class Engine:
 
         The save is lowered first and only then the deposit is sent, so a failed
         step can never leave the gold counted twice."""
+        if self.game_owns_save():
+            return 0, "Bot sedang main game: deposit dilakukan dari menu Wallet di dalam game."
         async with self._save_lock:
             s = await self.api.get_save()
             save, rev = s.get("save"), s.get("rev")
@@ -266,6 +276,8 @@ class Engine:
         return credited, f"✅ {credited} gold masuk bank."
 
     async def withdraw_bank(self, amount):
+        if self.game_owns_save():
+            return 0, "Bot sedang main game: stop dulu di menu 🎮 Game, baru tarik gold."
         async with self._save_lock:
             s = await self.api.get_save()
             save, rev = s.get("save"), s.get("rev")
@@ -334,6 +346,8 @@ class Engine:
         t = next((x for x in inv.get("tasks", []) if x["id"] == task), None)
         if not t:
             return False, "Task tidak ditemukan."
+        if self.game_owns_save():
+            return False, "Bot sedang main game: hadiah diklaim dari menu Invite di dalam game."
         async with self._save_lock:
             s = await self.api.get_save()
             save, rev = s.get("save"), s.get("rev")

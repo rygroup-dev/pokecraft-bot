@@ -2,6 +2,7 @@
 import asyncio
 import html
 import logging
+import os
 import time
 from collections import Counter, defaultdict
 from datetime import datetime
@@ -20,10 +21,11 @@ log = logging.getLogger("tg")
 
 LINE = "━━━━━━━━━━━━━━━━━━"
 REPLY_KB = ReplyKeyboardMarkup(
-    [[KeyboardButton("🏠 Dashboard"), KeyboardButton("🎣 Farm"), KeyboardButton("🎒 Tas")],
-     [KeyboardButton("🛒 Market"), KeyboardButton("🏦 Bank"), KeyboardButton("⚙️ Setelan")]],
+    [[KeyboardButton("🏠 Dashboard"), KeyboardButton("🎮 Game"), KeyboardButton("🎣 Farm")],
+     [KeyboardButton("🎒 Tas"), KeyboardButton("🛒 Market"), KeyboardButton("🏦 Bank")],
+     [KeyboardButton("⚙️ Setelan")]],
     resize_keyboard=True, is_persistent=True, input_field_placeholder="Pilih menu…")
-REPLY_ROUTES = {"🏠 Dashboard": "dash", "🎣 Farm": "farm", "🎒 Tas": "bag",
+REPLY_ROUTES = {"🏠 Dashboard": "dash", "🎮 Game": "game", "🎣 Farm": "farm", "🎒 Tas": "bag",
                 "🛒 Market": "market", "🏦 Bank": "bank", "⚙️ Setelan": "settings"}
 STATUS = {"farming": "🟢 Farming", "paused": "⏸ Dijeda", "limit": "🌙 Limit harian habis",
           "starting": "⏳ Menyiapkan…"}
@@ -69,7 +71,7 @@ class TelegramUI:
         self.e = engine
         self.app = Application.builder().token(token).post_init(self._post_init).build()
         self.app.add_handler(CommandHandler(["start", "menu"], self.cmd_start))
-        for cmd, screen in [("status", "dash"), ("farm", "farm"), ("tas", "bag"),
+        for cmd, screen in [("status", "dash"), ("game", "game"), ("farm", "farm"), ("tas", "bag"),
                             ("market", "market"), ("bank", "bank"), ("referral", "invite"),
                             ("karakter", "char"), ("setelan", "settings"), ("log", "log"),
                             ("help", "help")]:
@@ -83,6 +85,7 @@ class TelegramUI:
     async def _post_init(self, app: Application):
         await app.bot.set_my_commands([
             BotCommand("menu", "🏠 Dashboard utama"),
+            BotCommand("game", "🎮 Bot main game (quest, duel, crafting)"),
             BotCommand("farm", "🎣 Atur farming drop"),
             BotCommand("tas", "🎒 Item & jual ke market"),
             BotCommand("market", "🛒 Marketplace POKECRAFT"),
@@ -321,6 +324,20 @@ class TelegramUI:
             e.event(f"❌ Listing {arg} dibatalkan")
             await e.refresh()
             return "Listing dibatalkan", "market", None
+        if act == "game" and e.game:
+            if arg == "start":
+                await e.game.start()
+                return "▶️ Membuka game…", "game", None
+            if arg == "stop":
+                await e.game.stop()
+                return "⏹ Game dihentikan", "game", None
+            if arg == "shot":
+                path = os.path.join(os.path.dirname(e.store.path), "shot.png")
+                if await e.game.screenshot(path):
+                    with open(path, "rb") as f:
+                        await self.app.bot.send_photo(chat, f, caption=f"🎮 {e.game.brain.last_action[:150] if e.game.brain else ''}")
+                    return "📸 Terkirim", "game", None
+                return "Game belum terbuka", "game", None
         if act == "probe":
             ok = await e.probe_market()
             return ("🟢 Market buka" if ok else "🔴 Market masih ditutup server"), "market", None
@@ -401,6 +418,10 @@ class TelegramUI:
             f"├ 🎲 Roll {num(d['rolls'])} · 🎁 Drop {num(d['drops'])} · ✨ Rare {num(d['rare'])}",
             f"└ 💰 Gold +{num(d['gold'])} · 🏦 Depo {num(d['deposited'])} · 🛒 List {num(d['listed'])}",
         ]
+        if e.game is not None:
+            gs = {"off": "⏹ mati", "starting": "⏳ membuka…", "playing": "🟢 main", "error": "⚠️ error"}[e.game.state]
+            jl = ((e.game.last or {}).get("journey") or {}).get("line")
+            lines += ["", f"🎮 <b>Main game</b>: {gs}" + (f" · <i>{esc(jl)}</i>" if jl else "")]
         if e.market_ok is False:
             lines += ["", "🔴 <b>Market ditutup server game</b> — item & gold aman, bot kabari kalau buka."]
         if e.last_error:
@@ -409,6 +430,7 @@ class TelegramUI:
         farm_btn = B("⏸ Jeda Farming" if s.get("farm_on") else "▶️ Mulai Farming", callback_data="farm:toggle")
         return "\n".join(lines), kb([
             [farm_btn, B("🔄 Refresh", callback_data="refresh:dash")],
+            [B("🎮 Main Game", callback_data="nav:game")],
             [B("🎣 Farm", callback_data="nav:farm"), B("🎒 Tas", callback_data="nav:bag"),
              B("🛒 Market", callback_data="nav:market")],
             [B("🏦 Bank", callback_data="nav:bank"), B("🤝 Referral", callback_data="nav:invite"),
@@ -416,6 +438,48 @@ class TelegramUI:
             [B("⚙️ Setelan", callback_data="nav:settings"), B("📜 Log", callback_data="nav:log"),
              B("❓ Bantuan", callback_data="nav:help")],
         ])
+
+    async def scr_game(self, _=None):
+        g = self.e.game
+        if g is None or not g.available:
+            return ("🎮 <b>MAIN GAME</b>\n" + LINE + "\nBrowser Edge/Chrome tidak ditemukan di mesin ini, "
+                    "jadi bot tidak bisa memainkan game (quest, duel, crafting).", kb([back()]))
+        st = {"off": "⏹ Mati", "starting": "⏳ Membuka game (±2 menit)…", "playing": "🟢 Sedang main",
+              "error": "⚠️ Error, coba lagi otomatis"}[g.state]
+        s = g.last or {}
+        br = g.brain
+        lines = ["🎮 <b>MAIN GAME (browser)</b>", LINE, f"Status : <b>{st}</b>"]
+        if g.error:
+            lines.append(f"<i>{esc(g.error)}</i>")
+        if g.state == "playing":
+            mins = int((time.time() - g.started_at) // 60)
+            lines.append(f"Jalan  : {mins} menit")
+        if br:
+            lines += [f"Aksi   : <i>{esc(br.last_action[:90])}</i>"]
+        if s.get("pos"):
+            j = s.get("journey") or {}
+            lines += ["", f"👤 Trainer Lv <b>{esc(s.get('lvl'))}</b> · 👛 Gold kantong <b>{num(s.get('gems'))}</b>",
+                      f"🧭 Journey {j.get('step', '-')}/{j.get('total', '-')}: {esc(j.get('line'))}", "",
+                      "🐾 <b>Party</b>"]
+            for c in s.get("party", []):
+                lines.append(f"• {esc(c['species'])} Lv{c['level']} · HP {c['hp']}/{c.get('max') or '?'}")
+            qs = [q for q in s.get("quests", []) if not q["id"].startswith("jr_")]
+            if qs:
+                lines += ["", "📜 <b>Quest aktif</b>"]
+                for q in qs[:8]:
+                    lines.append(f"• {esc(q['title'])} ({esc(q['phase'])})")
+        if br:
+            st2 = br.stats
+            lines += ["", f"📊 Duel {st2['duels']} · Menang {st2['wins']} · Teman baru {st2['befriended']} · "
+                          f"Quest {st2['quests']}"]
+            if br.skipped:
+                lines += ["", "⏭ <b>Dilewati (belum didukung)</b>"]
+                for k, v in list(br.skipped.items())[:6]:
+                    lines.append(f"• {esc(k)}: {esc(v)}")
+        btn = (B("⏹ Stop main", callback_data="game:stop") if g.running
+               else B("▶️ Mulai main", callback_data="game:start"))
+        return "\n".join(lines), kb([[btn, B("📸 Screenshot", callback_data="game:shot")],
+                                     [B("🔄 Refresh", callback_data="nav:game")], back()])
 
     async def scr_farm(self, _=None):
         s = self.e.store
