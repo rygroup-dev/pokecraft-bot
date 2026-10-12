@@ -99,6 +99,8 @@ class Browser:
                 "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows",
                 "--autoplay-policy=no-user-gesture-required", "--mute-audio",
                 "--disable-features=CalculateNativeWinOcclusion,Translate", "about:blank"]
+        if sys.platform != "win32" and os.geteuid() == 0:   # Chromium refuses root without these
+            args[1:1] = ["--no-sandbox", "--disable-dev-shm-usage"]
         if self.headless:
             args.insert(1, "--headless=new")
             args.insert(1, "--use-angle=swiftshader")
