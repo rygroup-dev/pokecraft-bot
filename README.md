@@ -22,19 +22,59 @@ Bot farming untuk [Pokecraft](https://pokecraft.cartridgepad.fun/?ref=tcswarv7) 
 - 🔒 **1 komputer = 1 bot = 1 akun**. Bot hanya merespons pemiliknya.
 
 ## Persiapan (sekali saja)
-1. **Buat akun**: buka https://pokecraft.cartridgepad.fun/?ref=tcswarv7, buat karakter, lalu di menu **Wallet** connect wallet Solana dan klik **Save progress online**.
-2. Buat bot Telegram di [@BotFather](https://t.me/BotFather) dan catat tokennya. ID Telegram kamu bisa dilihat di [@userinfobot](https://t.me/userinfobot).
-3. Siapkan isi `.env`:
-   - `PRIVATE_KEY`: private key wallet (Phantom → Settings → Export Private Key)
-   - `TELEGRAM_BOT_TOKEN` dan `TELEGRAM_OWNER_ID`
+1. **Buat akun lewat link referral**: buka https://pokecraft.cartridgepad.fun/?ref=tcswarv7, buat karakter, lalu di menu **Wallet** connect wallet Solana dan klik **Save progress online**.
+2. Buat bot Telegram di [@BotFather](https://t.me/BotFather) (`/newbot`) dan catat tokennya. ID Telegram kamu bisa dilihat di [@userinfobot](https://t.me/userinfobot).
+3. Siapkan **private key** wallet tadi (Phantom → Settings → Manage Accounts → pilih akun → Show Private Key). Format base58 atau array 64 angka (Solflare / Solana CLI) sama-sama bisa.
 
-## 🪟 Windows
+## ⚡ Install satu baris (disarankan)
+Installer memasang semua yang dibutuhkan, menanyakan private key, token bot dan ID Telegram, lalu mengisi `.env` (kode referral `tcswarv7` sudah otomatis). Jalankan perintah yang sama lagi untuk **update**; `.env` dan progres tidak hilang.
+
+### 🪟 Windows 10 / 11
+Buka **PowerShell** (tekan tombol Windows, ketik `powershell`, Enter; tidak perlu Administrator), lalu tempel:
+```powershell
+irm https://raw.githubusercontent.com/rygroup-dev/pokecraft-bot/main/install.ps1 | iex
+```
+- Python 3.12 dipasang otomatis kalau belum ada.
+- Bot dipasang ke `C:\Users\<nama>\pokecraft-bot`, plus shortcut **Pokecraft Bot** dan **Stop Pokecraft Bot** di Desktop.
+- Lokasi lain: `$env:POKECRAFT_DIR="D:\pokecraft-bot"; irm https://raw.githubusercontent.com/rygroup-dev/pokecraft-bot/main/install.ps1 | iex`
+
+### 🐧 VPS (Ubuntu 22.04+ / Debian 12+ / Fedora)
+Login SSH, lalu:
+```bash
+curl -fsSL https://raw.githubusercontent.com/rygroup-dev/pokecraft-bot/main/install.sh | bash
+```
+- Paket `git python3 python3-venv tmux nano` dipasang otomatis (pakai `sudo` kalau bukan root).
+- Bot jalan di sesi tmux `poke`. Opsional: auto start saat VPS reboot (systemd service `pokecraft-bot`).
+
+### 📱 HP Android (Termux + tmux)
+1. Install **Termux** dari [F-Droid](https://f-droid.org/packages/com.termux/) (versi Play Store sudah usang). Opsional: **Termux:Boot** dari F-Droid untuk auto start saat HP menyala.
+2. Buka Termux, tempel:
+```bash
+pkg install -y curl && curl -fsSL https://raw.githubusercontent.com/rygroup-dev/pokecraft-bot/main/install.sh | bash
+```
+3. Di Setelan Android, matikan **battery optimization** untuk Termux supaya bot tidak ditidurkan.
+
+### Perintah harian (VPS & Termux)
+| Perlu apa | Perintah |
+|---|---|
+| Lihat bot jalan | `tmux attach -t poke` (keluar tanpa mematikan: `Ctrl+B` lalu `D`) |
+| Jalankan bot | `tmux new -d -s poke 'cd ~/pokecraft-bot && ./run.sh'` |
+| Berhenti rapi | `~/pokecraft-bot/stop.sh` |
+| Lihat log | `tail -f ~/pokecraft-bot/logs/bot.log` |
+| Ganti data `.env` | `nano ~/pokecraft-bot/.env` lalu restart bot |
+| Service VPS (kalau dipasang) | `sudo systemctl start` / `stop` / `status pokecraft-bot` |
+
+Setelah bot jalan, kirim **/menu** ke bot Telegram kamu.
+
+## 🛠 Install manual
+
+### 🪟 Windows
 1. Install [Python 3.11+](https://www.python.org/downloads/) dan centang **Add python.exe to PATH**.
 2. Download repo ini (Code → Download ZIP), lalu extract.
 3. Klik dua kali `run.bat`. Pertama kali jalan, file `.env` terbuka di Notepad: isi, simpan, lalu jalankan `run.bat` lagi.
 4. Kirim `/menu` ke bot Telegram kamu.
 
-## 🐧 VPS (Ubuntu/Debian)
+### 🐧 VPS (Ubuntu/Debian)
 ```bash
 sudo apt update && sudo apt install -y git python3 python3-venv tmux
 git clone https://github.com/rygroup-dev/pokecraft-bot.git && cd pokecraft-bot
@@ -45,7 +85,7 @@ tmux new -s poke    # biar tetap jalan saat SSH ditutup
 ```
 Masuk lagi ke bot: `tmux attach -t poke`.
 
-## 📱 HP Android (Termux)
+### 📱 HP Android (Termux)
 1. Install **Termux** dari [F-Droid](https://f-droid.org/packages/com.termux/). Versi Play Store sudah usang.
 2. Jalankan:
 ```bash

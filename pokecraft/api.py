@@ -32,7 +32,12 @@ class ApiError(Exception):
 
 class Wallet:
     def __init__(self, private_key_b58: str):
-        raw = base58.b58decode(private_key_b58.strip())
+        key = private_key_b58.strip()
+        if key.startswith("["):
+            # Solana CLI / Solflare export: JSON array of 64 numbers
+            raw = bytes(int(x) for x in key.strip("[]").split(",") if x.strip())
+        else:
+            raw = base58.b58decode(key)
         if len(raw) not in (32, 64):
             raise ValueError("PRIVATE_KEY harus base58 64-byte (format Phantom) atau 32-byte seed")
         self._seed = raw[:32]

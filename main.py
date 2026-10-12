@@ -70,12 +70,14 @@ def main():
     os.makedirs(os.path.join(ROOT, "data"), exist_ok=True)
     store = Store(os.path.join(ROOT, "data", "state.json"))
     engine = Engine(PokecraftApi(wallet), store, Chain(os.getenv("SOLANA_RPC") or None),
-                    ref_code=os.getenv("REF_CODE", "tcswarv7"))
+                    ref_code=(os.getenv("REF_CODE") or "").strip() or "tcswarv7")
     engine.game = GameRunner(engine, os.path.join(ROOT, "data"))
     ui = TelegramUI(need("TELEGRAM_BOT_TOKEN"), owner, engine)
     orig = ui.app.post_init
 
     stop_flag = os.path.join(ROOT, "data", "stop.flag")
+    if os.path.exists(stop_flag):
+        os.remove(stop_flag)                 # left from an earlier stop: not meant for this run
 
     async def watch_stop_flag():
         """Create data/stop.flag to stop cleanly: the game saves first, then the bot exits."""
