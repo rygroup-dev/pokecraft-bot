@@ -132,6 +132,7 @@ class GameRunner:
                 brain_task = asyncio.create_task(self.brain.run(self._stop))
                 if self.e.store.get("game_hidden"):
                     await self.browser.set_hidden(True)
+                econ_off = 0.0
                 try:
                     while not self._stop.is_set() and not brain_task.done():
                         await asyncio.sleep(15)
@@ -148,6 +149,16 @@ class GameRunner:
                                 self.player.js("window.__pkbot ? __pkbot.state() : {phase: 'noagent'}"), 20)
                         except Exception as ex:  # noqa: BLE001
                             raise RuntimeError(f"game tidak merespons: {ex!r}") from ex
+                        # the online economy session (game econ.available, also what shows the
+                        # Wallet tab): without it nothing is saved to the server, so whatever the
+                        # bot does is lost on the next start. Reopen right away with a fresh login.
+                        econ = await self.player.js("window.__pk && __pk.phase === 'play' ? !!(__pk.econ && __pk.econ.available) : null")
+                        if econ is False:
+                            econ_off = econ_off or time.time()
+                            if time.time() - econ_off > 60:
+                                raise RuntimeError("sesi online game putus (Wallet hilang, progres tidak tersimpan): buka ulang")
+                        else:
+                            econ_off = 0.0
                 finally:
                     brain_task.cancel()
                     try:

@@ -3,7 +3,7 @@
 (() => {
   const G = () => window.__pk;
   const X = () => window.__pkx || {};
-  const B = { ver: 21 };
+  const B = { ver: 28 };
 
   B.blockName = (id) => { const d = X().Du && X().Du[id]; return d ? d.name : String(id); };
   B.blockIds = (re) => {
@@ -137,6 +137,20 @@
       .map((s) => ({ i: s.i, x: s.x + 0.5, y: s.y, z: s.z + 0.5, d: Math.hypot(s.x + 0.5 - p.x, s.z + 0.5 - p.z) }))
       .filter((s) => s.d <= r).sort((a, b) => a.d - b.d).slice(0, 10);
   };
+  // Shops whose stock (game shop table ew) has this item and whose requirement we meet.
+  B.shopsSelling = (item) => {
+    // keeper = the NPC whose dialogue opens that shop (openShop action), checked the same way
+    // the game does it when buying (NZ(save, row.requires, {hour})).
+    const g = G(); const out = []; const ew = X().ew || {}; const NZ = X().NZ;
+    for (const k of B.shopNpcs()) {
+      const def = ew[k.shop];
+      const row = def && (def.stock || []).find((x) => x.item === item);
+      if (!row) continue;
+      if (row.requires && !(NZ && NZ(g.save, row.requires, { hour: g.clock ? g.clock.hour : 12 }))) continue;
+      out.push({ shop: k.shop, npc: k.id, name: k.name, state: k.state, d: k.d });
+    }
+    return out;
+  };
   // Shopkeepers (NPCs whose talk has an openShop action), nearest first, with their state.
   B.shopNpcs = () => {
     const g = G(); const p = g.player.pos; const out = [];
@@ -249,6 +263,39 @@
     }
     return null;
   };
+  // Field quests (game farm rule: 12+ connected farmland, water within 4 blocks, near the
+  // village that asked = within 90 m of its anchor). Finds a dry tillable patch next to water.
+  B.fieldSpot = (anchorId, r) => {
+    const g = G(); const p = g.player.pos; const w = W(); r = r || 70;
+    const anchor = anchorId ? (g.world.places.find((x) => x.id === anchorId) || (g.world.regions || []).find((x) => x.id === anchorId)) : null;
+    const cx = anchor ? anchor.x : p.x, cz = anchor ? anchor.z : p.z;
+    const tillY = (x, z) => { if (g.build.isProtected(x, z)) return null; const y = w.topY(x, z) - 1; if (y < 2 || w.get(x, y + 1, z) !== 0) return null; return g.farm.canTill(x, y, z) ? y : null; };
+    const wet = (x, z) => { const wl = B.waterLevel(x, z); return wl > 0 && wl > w.groundBelow(x + 0.5, z + 0.5, Math.floor(wl) + 1) + 0.3; };
+    let best = null;
+    for (let x = Math.floor(cx - r); x <= cx + r; x++) for (let z = Math.floor(cz - r); z <= cz + r; z++) {
+      if (anchor && Math.hypot(x - anchor.x, z - anchor.z) > 85) continue;
+      if (tillY(x, z) === null) continue;
+      let water = false;
+      for (let a = -3; a <= 3 && !water; a++) for (let b = -3; b <= 3 && !water; b++) if (wet(x + a, z + b)) water = true;
+      if (!water) continue;
+      let n = 0;
+      for (let a = -2; a <= 2; a++) for (let b = -2; b <= 2; b++) if (tillY(x + a, z + b) !== null) n++;
+      if (n < 14) continue;
+      const d = Math.hypot(x - p.x, z - p.z);
+      if (!best || d < best.d) best = { x: x + 0.5, z: z + 0.5, n, d };
+    }
+    return best;
+  };
+  // Size of the connected farmland cluster around a point (8-neighbour, like the game's check).
+  B.farmCluster = (x0, z0) => {
+    const w = W(); const FL = X().F.Farmland; const seen = new Set(); const q = [];
+    const isFL = (x, z) => { const y = w.topY(x, z) - 1; return w.get(x, y, z) === FL; };
+    for (let a = -3; a <= 3; a++) for (let b = -3; b <= 3; b++) if (isFL(x0 + a, z0 + b)) { q.push([x0 + a, z0 + b]); break; }
+    let n = 0;
+    while (q.length) { const [x, z] = q.pop(); const k = x * 512 + z; if (seen.has(k) || !isFL(x, z)) continue; seen.add(k); n++;
+      for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) if (a || b) q.push([x + a, z + b]); }
+    return n;
+  };
   B.isProtected = (x, z) => !!G().build.isProtected(x, z);
   B.waterLevel = (x, z) => { try { return W().waterAt(x + 0.5, z + 0.5); } catch (e) { return -1; } };
 
@@ -358,8 +405,8 @@
     return out.slice(0, 20);
   };
 
-  B.findBlocks = (re, r) => {
-    r = r || 40;
+  B.findBlocks = (re, r, limit) => {
+    r = r || 40; limit = limit || 30;
     const g = G(); const p = g.player.pos; const w = W();
     const ids = new Set(B.blockIds(re));
     const out = [];
@@ -370,7 +417,7 @@
         if (ids.has(id)) out.push({ x, y, z, d: Math.hypot(x - p.x, z - p.z), name: B.blockName(id) });
       }
     out.sort((a, b) => a.d - b.d);
-    return out.slice(0, 30);
+    return out.slice(0, limit);
   };
 
   B.npcs = () => {
@@ -427,7 +474,132 @@
 
   // camera ray (origin + direction) so the bot can aim like a player
   B.ray = () => { const r = G().cam.ray(); return { o: [r.o.x, r.o.y, r.o.z], d: [r.d.x, r.d.y, r.d.z] }; };
-  B.hit = () => { const h = G().act.hit; return h ? { x: h.x, y: h.y, z: h.z, id: h.id, t: h.t, name: B.blockName(h.id) } : null; };
+  B.hit = () => { const h = G().act.hit; return h ? { x: h.x, y: h.y, z: h.z, nx: h.nx, ny: h.ny, nz: h.nz, id: h.id, t: h.t, name: B.blockName(h.id) } : null; };
+
+  // ------------------------------------------------------------------ crafting & building
+  // Recipes from the game's table (yC); `out` filters by produced item.
+  B.recipes = (out) => (X().yC || []).filter((r) => !out || r.out.id === out)
+    .map((r) => ({ id: r.id, name: r.name, station: r.station, key: r.key, in: r.in, out: r.out, fuel: !!r.fuel }));
+  // The game's own can-craft check (EC): {ok, reason, missing}. station: hand|workbench|furnace.
+  B.craftCheck = (id, station) => { try { const r = X().EC(G().save, id, station); return { ok: !!r.ok, reason: r.reason || '', missing: r.missing || [] }; } catch (e) { return { ok: false, reason: String(e) }; } };
+  // Item that places a block id: from the recipe outputs, else the plain blk_ item.
+  B.itemPlacing = (block) => {
+    const r = (X().yC || []).find((r) => B.blockOf(r.out.id) === block);
+    return r ? r.out.id : null;
+  };
+  B.known = (key) => { try { return !!X().dC(G().save, key); } catch (e) { return false; } };
+  // The game's house detector (kw, same call the quest scanner makes: center = player, r 24).
+  B.house = () => {
+    const g = G();
+    try { const r = X().kw('house', g.world, g.world.edits, { center: g.player.pos, radius: 24 });
+          return { ok: !!r.ok, missing: r.missing || [], at: r.at || null, score: r.score }; }
+    catch (e) { return { ok: false, err: String(e), missing: [] }; }
+  };
+  // Flat dry 7x7 patch outside protected land: a 5x5 house footprint plus a ring to walk on.
+  // Returns {x0, z0, y0} (footprint corner, floor height) nearest to (cx,cz) within r.
+  B.houseSite = (cx, cz, r, maxFromAnchor) => {
+    const g = G(); const w = W(); const p = g.player.pos;
+    cx = cx ?? p.x; cz = cz ?? p.z; r = r || 60;
+    const GROUND = /grass|dirt|sand|snow|path|moss/i;
+    const col = (x, z) => {
+      if (x < 2 || z < 2 || x > 381 || z > 381 || g.build.isProtected(x, z)) return null;
+      const top = w.topY(x, z); const y = top - 1;
+      if (y < 2 || !GROUND.test(B.blockName(w.get(x, y, z)))) return null;
+      for (let k = 0; k <= 4; k++) if (w.get(x, top + k, z) !== 0) return null;
+      const wl = B.waterLevel(x, z); if (wl > 0 && wl > y + 0.3) return null;
+      if (g.farm.cropOn && g.farm.cropOn(x, y, z)) return null;
+      return top;
+    };
+    let best = null;
+    for (let x = Math.floor(cx - r); x <= cx + r; x++) for (let z = Math.floor(cz - r); z <= cz + r; z++) {
+      const d = Math.hypot(x + 2.5 - p.x, z + 2.5 - p.z);
+      if (best && d >= best.d) continue;
+      if (maxFromAnchor && Math.hypot(x + 2.5 - cx, z + 2.5 - cz) > maxFromAnchor) continue;
+      const y0 = col(x, z); if (y0 === null) continue;
+      let ok = true;
+      for (let a = -1; a <= 5 && ok; a++) for (let b = -1; b <= 5 && ok; b++) if (col(x + a, z + b) !== y0) ok = false;
+      if (ok) best = { x0: x, z0: z, y0, d };
+    }
+    return best;
+  };
+  // Solid neighbours of an empty cell = faces a block can be placed against (placed cell =
+  // hit block + hit normal). d = direction from the support to the target cell.
+  B.supports = (x, y, z) => {
+    const w = W(); const out = [];
+    for (const [dx, dy, dz] of [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]) {
+      const sx = x - dx, sy = y - dy, sz = z - dz;
+      const id = w.get(sx, sy, sz);
+      // a door is no support: right click on a door opens/closes it (game act.secondary)
+      if (id !== 0 && id !== X().F.Door) out.push({ s: [sx, sy, sz], d: [dx, dy, dz] });
+    }
+    return out;
+  };
+  // Natural blocks (name regex) we may break that have open air on top and a spot to stand
+  // beside them, not under water: [{x,y,z,sx,sz,d}] nearest first.
+  B.minable = (re, r, skip) => {
+    // surface blocks only (top of each column), nearest columns first; skip = [[x,z],...]
+    const g = G(); const p = g.player.pos; const w = W(); r = r || 60;
+    const bad = new Set((skip || []).map(([x, z]) => x * 512 + z));
+    const ids = new Set(B.blockIds(re)); const cols = [];
+    const px = Math.floor(p.x), pz = Math.floor(p.z);
+    for (let x = px - r; x <= px + r; x++) for (let z = pz - r; z <= pz + r; z++) {
+      const d = Math.hypot(x + 0.5 - p.x, z + 0.5 - p.z);
+      if (d <= r) cols.push([d, x, z]);
+    }
+    cols.sort((a, b) => a[0] - b[0]);
+    const out = [];
+    for (const [d, x, z] of cols) {
+      if (bad.has(x * 512 + z) || g.build.isProtected(x, z)) continue;
+      const y = w.topY(x, z) - 1;
+      if (y < 2 || !ids.has(w.get(x, y, z)) || !B.canBreak(x, y, z).ok) continue;
+      const wl = B.waterLevel(x, z); if (wl > 0 && wl > y + 0.8) continue;
+      for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const sy = B.stand(x + dx, z + dz, y + 1);
+        if (sy !== null && Math.abs(sy - (y + 1)) <= 1) { out.push({ x, y, z, d, sx: x + dx + 0.5, sz: z + dz + 0.5 }); break; }
+      }
+      if (out.length >= 10) break;
+    }
+    return out;
+  };
+  // Densest patch of minable surface blocks (8x8 cells) within r, weighed by distance:
+  // walk there once and mine around it. {x, z, n, d} or null.
+  B.richSpot = (re, r, skip) => {
+    const g = G(); const p = g.player.pos; const w = W(); r = r || 160;
+    const ids = new Set(B.blockIds(re)); const cells = new Map();
+    const bad = new Set((skip || []).map(([x, z]) => Math.floor(x / 8) * 64 + Math.floor(z / 8)));
+    const px = Math.floor(p.x), pz = Math.floor(p.z);
+    for (let x = Math.max(2, px - r); x <= Math.min(381, px + r); x++) for (let z = Math.max(2, pz - r); z <= Math.min(381, pz + r); z++) {
+      const y = w.topY(x, z) - 1;
+      if (y < 2 || !ids.has(w.get(x, y, z)) || g.build.isProtected(x, z)) continue;
+      const wl = B.waterLevel(x, z); if (wl > 0 && wl > y + 0.8) continue;
+      const k = Math.floor(x / 8) * 64 + Math.floor(z / 8);
+      if (bad.has(k)) continue;
+      const c = cells.get(k) || { n: 0, sx: 0, sz: 0 }; c.n++; c.sx += x; c.sz += z; cells.set(k, c);
+    }
+    let best = null;
+    for (const c of cells.values()) {
+      if (c.n < 6) continue;
+      const x = c.sx / c.n + 0.5, z = c.sz / c.n + 0.5, d = Math.hypot(x - p.x, z - p.z);
+      const score = Math.min(c.n, 30) / (1 + d / 50);
+      if (!best || score > best.score) best = { x, z, n: c.n, d, score };
+    }
+    return best;
+  };
+  // Placed stations (Workbench / Furnace blocks) anywhere within r, nearest first (wide height
+  // range: villages sit lower or higher than where we stand).
+  B.stations = (name, r) => {
+    const g = G(); const p = g.player.pos; const w = W(); r = r || 220;
+    const id = Number(Object.keys(X().Du).find((k) => X().Du[k] && X().Du[k].name === name));
+    const out = []; const px = Math.floor(p.x), pz = Math.floor(p.z);
+    for (let x = Math.max(1, px - r); x <= Math.min(382, px + r); x++) for (let z = Math.max(1, pz - r); z <= Math.min(382, pz + r); z++) {
+      const top = w.topY(x, z);
+      for (let y = Math.max(1, top - 4); y <= top + 1; y++) if (w.get(x, y, z) === id) out.push({ x, y, z, d: Math.hypot(x - p.x, z - p.z) });
+    }
+    return out.sort((a, b) => a.d - b.d).slice(0, 5);
+  };
+  B.overlaps = (x, y, z) => { try { return !!G().player.overlapsCell(x, y, z); } catch (e) { return false; } };
+  // Item in the bag that places a block id.
+  B.itemFor = (block) => { const s = G().save; const it = s.inv.find((x) => x && B.blockOf(x.id) === block); return it ? it.id : null; };
 
   // Quests the game would offer right now (quests.available: requires met, not taken yet,
   // repeatables cooled down), per giver NPC that is in this world.
@@ -522,9 +694,24 @@
       if (r.width < 4 || r.height < 4) return;
       const cs = getComputedStyle(el);
       if (cs.visibility === 'hidden' || cs.display === 'none' || Number(cs.opacity) === 0) return;
+      // scroll box the button sits in: when its centre is outside that box it must be scrolled
+      // into view (mouse wheel over the box) before a click lands on it
+      let sp = el.parentElement;
+      while (sp && sp !== document.body) {
+        const ss = getComputedStyle(sp);
+        if (/(auto|scroll)/.test(ss.overflowY) && sp.scrollHeight > sp.clientHeight + 2) break;
+        sp = sp.parentElement;
+      }
+      const cy = r.y + r.height / 2;
+      let vis = cy > 0 && cy < innerHeight; let box = null;
+      if (sp && sp !== document.body) {
+        const pr = sp.getBoundingClientRect();
+        vis = vis && cy > pr.top + 2 && cy < pr.bottom - 2;
+        box = { x: pr.x + pr.width / 2, y: pr.y + pr.height / 2, dy: cy - (pr.top + pr.bottom) / 2 };
+      }
       out.push({ text: (el.innerText || el.getAttribute('aria-label') || el.title || '').trim().replace(/\s+/g, ' ').slice(0, 80),
                  fid: el.dataset ? el.dataset.fid || '' : '', off: el.disabled || el.getAttribute('aria-disabled') === 'true',
-                 x: r.x + r.width / 2, y: r.y + r.height / 2, cls: String(el.className).slice(0, 60) });
+                 x: r.x + r.width / 2, y: cy, cls: String(el.className).slice(0, 60), vis, box });
     });
     return out;
   };

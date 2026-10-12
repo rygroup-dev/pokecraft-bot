@@ -3,6 +3,7 @@
 Only objectives whose mechanics were checked in the game client are automated; anything
 else is reported as skipped instead of being guessed at."""
 import asyncio
+import json
 import logging
 import math
 import os
@@ -54,6 +55,10 @@ class Brain:
         self._bag_at = 0.0
         self._heal_fail = 0
         self._heal_pause = 0.0
+        self._house = None           # house site being built {x0, z0, y0}
+        self._bad_mine = set()       # (x, z) of blocks we could not walk up to
+        self._mine_seen = False
+        self._bad_rich = set()       # mining areas we could not walk to
 
     async def say(self, text):
         log.info("MILESTONE %s", text)
@@ -227,16 +232,22 @@ class Brain:
         return max(seeds, key=lambda x: x["n"])["id"] if seeds else None
 
     async def buy_item(self, item, n):
-        """Buy n of an item at Tilly's store (shop > Buy tab > row > Buy)."""
-        if not await self.npc_out("tilly"):
+        """Buy n of an item at a shop that sells it (game shop table), nearest open one first
+        (shop > Buy tab > row > Buy)."""
+        sellers = await self.p.js(f"__pkbot.shopsSelling('{item}')")
+        if not sellers:
+            self.skipped[item] = "tidak dijual di toko mana pun (yang syaratnya terpenuhi)"
             return False
-        self.act(f"buy {n}x {item} at Tilly")
-        await self.p.talk("tilly", goals=["openShop"])
+        seller = next((x for x in sellers if x.get("state") != "inside"), None)
+        if not seller:
+            return False                       # all sellers are at home right now
+        self.act(f"buy {n}x {item} at {seller['name']}")
+        await self.p.talk(seller["npc"], goals=["openShop"])
         await asyncio.sleep(1.0)
         await self.p.click_button(fid="tab-buy", wait=0.6)
         if not await self.p.click_button(fid="row-" + item, wait=0.5):
             await self.p.close_menus()
-            self.skipped[item] = "tidak dijual di toko Tilly"
+            self.skipped[item] = f"tidak ada di menu beli {seller['name']}"
             return False
         before = sum(x["n"] for x in (await self.p.st())["inv"] if x["id"] == item)
         for _ in range(n):
@@ -249,7 +260,7 @@ class Brain:
     async def do_plant(self, s, n, crop=None):
         seed = self._seed_for(s, crop)
         if not seed and crop:
-            # the crop's seed is not in the bag: buy it at Tilly's (she sells seeds)
+            # the crop's seed is not in the bag: buy it at a shop that stocks it
             if await self.buy_item(f"{crop}_seed", max(n, 4)):
                 s = await self.p.st()
                 seed = next((x["id"] for x in s["inv"] if x["id"] == f"{crop}_seed"), None)
@@ -286,6 +297,26 @@ class Brain:
         self.act(f"crops growing ({len(crops)}), doing other things meanwhile")
         return "wait"
 
+    async def build_field(self, near=None):
+        """Field quest: 12+ connected farmland patches within 4 blocks of water, near the village
+        that asked (game farm rule). Tills a block of ground next to water."""
+        spot = await self.p.js(f"__pkbot.fieldSpot({json.dumps(near) if near else 'null'}, 70)")
+        if not spot:
+            self.skipped["field"] = f"tidak ada tanah dekat air di sekitar {near or 'sini'}"
+            return False
+        self.act(f"build a field at {spot['x']:.0f},{spot['z']:.0f} ({spot['n']} patches around)")
+        if not await self.p.walk_to(spot["x"], spot["z"], near=0.8, timeout=300):
+            return False
+        cx, cz = int(spot["x"]), int(spot["z"])
+        for dx, dz in ((0, 0), (2, 0), (-2, 0), (0, 2), (0, -2), (2, 2), (-2, -2)):
+            if await self.p.js(f"__pkbot.farmCluster({cx}, {cz})") >= 13:
+                break
+            await self.p.walk_to(cx + dx + 0.5, cz + dz + 0.5, near=0.6, timeout=20)
+            await self.p.till(8)
+        n = await self.p.js(f"__pkbot.farmCluster({cx}, {cz})")
+        self.act(f"field has {n} connected patches")
+        return n >= 12
+
     async def place_specific(self, block, n):
         """Place n blocks of a given block id (quest: '8 planks for the seat', '6 lanterns').
         Uses a bag item that places that block; saws logs into planks when planks are short.
@@ -296,25 +327,21 @@ class Brain:
             if await self.p.js(f"__pkbot.blockOf('{x['id']}')") == block:
                 item = x
                 break
-        planks = await self.p.js("__pkx.F.Planks")
-        if (not item or item["n"] < n) and block == planks:
-            logs = sum(x["n"] for x in s["inv"] if x["id"] in ("oak_log", "birch_log"))
-            if logs:
-                self.act("saw logs into planks for building")
-                await self.p.b.tap("KeyI")
-                await asyncio.sleep(1)
-                await self.p.click_button(fid="tab-craft", wait=0.8)
-                for _ in range(min(3, logs)):
-                    rec = "cr-planks_oak" if any(x["id"] == "oak_log" for x in (await self.p.st())["inv"]) else "cr-planks_birch"
-                    await self.p.click_button(fid=rec, wait=0.4)
-                    await self.p.click_button(fid="cr-go", wait=0.6)
-                await self.p.close_menus()
-                s = await self.p.st()
-                item = next((x for x in s["inv"] if x["id"] == "blk_planks"), None)
-        if not item:
-            name = await self.p.js(f"__pkbot.blockName({block})")
-            self.skipped[f"block {name}"] = "tidak punya blok ini (belum bisa dibuat)"
-            return None
+        if not item or item["n"] < n:
+            # make / gather them (recipe table: planks from logs, lanterns from glass + iron +
+            # glow crystal ...)
+            want = item["id"] if item else await self.p.js(f"__pkbot.itemPlacing({block})")
+            if want and not item and not await self.can_obtain(want, n):
+                want = None                   # e.g. lanterns need glow crystals we cannot get yet
+            res = await self.obtain(want, n) if want else None
+            if res is None and not item:
+                name = await self.p.js(f"__pkbot.blockName({block})")
+                self.skipped[f"block {name}"] = "tidak bisa didapat/dibuat sekarang"
+                return None
+            if res is not True and not item:
+                return res
+            s = await self.p.st()
+            item = next((x for x in s["inv"] if x["id"] == want), item)
         if len(await self.p.js("__pkbot.placeSpots(3)")) < min(n, 3):
             spot = await self.p.js("__pkbot.findTillSpot(60, 6)")
             if not spot or not await self.p.walk_to(spot["x"], spot["z"], near=1.2, timeout=120):
@@ -341,10 +368,15 @@ class Brain:
         await self.p.talk("ferris", goals=["openMuseum"])
         await asyncio.sleep(1.0)
         done = 0
-        for b in await self.p.buttons():
-            if b["fid"].startswith("don-") and done < n:
-                await self.p.b.click(b["x"], b["y"])
-                await asyncio.sleep(0.8)
+        tried = set()
+        while done < n:
+            # read the list again after every donation: rows move up when one goes
+            b = next((b for b in await self.p.buttons() if b["fid"].startswith("don-")
+                      and b["fid"] not in tried and not b["off"]), None)
+            if not b:
+                break
+            tried.add(b["fid"])
+            if await self.p.click_button(fid=b["fid"], wait=0.8):
                 done += 1
         await self.p.close_menus()
         if done:
@@ -534,7 +566,11 @@ class Brain:
 
     KEEP_ALWAYS = {"hoe", "wooden_hoe", "watering_can", "bug_net", "fishing_rod", "shovel", "wooden_shovel",
                    "wooden_pickaxe", "wooden_axe", "stone_pickaxe", "stone_axe", "iron_pickaxe", "iron_axe",
-                   "oak_log", "birch_log", "blk_planks", "stick"}
+                   "oak_log", "birch_log", "blk_planks", "stick",
+                   # building / crafting materials (house: window + door, lanterns: glass, iron,
+                   # glow crystal; furnace fuel)
+                   "blk_sand", "blk_window", "blk_door", "blk_lamp", "blk_lantern", "blk_crystal",
+                   "iron_ore", "iron_ingot", "glow_crystal", "charcoal"}
 
     TOOL_RANK = {  # same job, better tool last: keep only the best one of each
         "hoe": ["hoe", "wooden_hoe", "stone_hoe", "iron_hoe"],
@@ -616,6 +652,13 @@ class Brain:
             if d.get("sell") is None or (not crop and (d.get("treat") or d.get("heal") or d.get("kind") in ("food", "tool", "seed"))):
                 continue
             sell.append(x["id"])
+        # museum pieces first: each kind is a whole slot, and donating also counts for the
+        # museum quests (shops only buy some kinds, Bram none of them)
+        if museum and await self.npc_out("ferris"):
+            if await self.donate_museum(len(museum)):
+                s = await self.p.st()
+                if (s.get("invCap") or 30) - len(s["inv"]) >= min_free:
+                    return True
         shop = await self.nearest_shop() if sell else None
         if not shop:
             if museum and await self.npc_out("ferris"):
@@ -639,7 +682,7 @@ class Brain:
             sold += 1
         await self.p.close_menus()
         after = await self.p.st()
-        await self.say(f"🛍 Tas penuh, jual {sold} jenis barang ke Tilly (gold {s.get('gems')} → {after.get('gems')})")
+        await self.say(f"🛍 Tas penuh, jual {sold} jenis barang ke {shop['name']} (gold {s.get('gems')} → {after.get('gems')})")
         return True
 
     async def nearest_shop(self):
@@ -750,8 +793,10 @@ class Brain:
         return sum(x["n"] for x in s["inv"] if x["id"] == item)
 
     async def use_station(self, name):
-        blocks = await self.p.js("__pkbot.findBlocks(/^%s$/i, 70)" % name)
+        blocks = await self.p.js("__pkbot.stations('%s', 220)" % name.capitalize())
         for w in blocks[:3]:
+            if w["d"] > 6:
+                await self.p.walk_to(w["x"] + 0.5, w["z"] + 0.5, near=3.0, timeout=200)
             for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
                 y = await self.p.js(f"__pkbot.stand({w['x'] + dx},{w['z'] + dz},{w['y']})")
                 if y is None:
@@ -763,6 +808,387 @@ class Brain:
                     await asyncio.sleep(1)
                     if (await self.p.st()).get("menus"):
                         return True
+        return False
+
+    # ------------------------------------------------------------------ crafting & materials
+    # natural blocks to break for a raw item (the game drops the block's item into the bag)
+    RAW = {"blk_sand": r"^sand$", "iron_ore": r"^iron ore$", "blk_cobblestone": r"^stone$|^cobblestone$",
+           "blk_dirt": r"^dirt$"}
+    SPECIAL_KEYS = {"lantern", "crystal_lamp", "snow_brick", "ice"}     # game cC
+    TOOLS = {"wood": ("iron_axe", "stone_axe", "wooden_axe"),
+             "rock": ("iron_pickaxe", "stone_pickaxe", "wooden_pickaxe"),
+             "soil": ("iron_shovel", "stone_shovel", "shovel")}
+
+    async def hold_tool(self, kind):
+        inv = {x["id"] for x in (await self.p.st())["inv"]}
+        for t in self.TOOLS[kind]:
+            if t in inv:
+                return await self.p.select_item(t)
+        return False
+
+    async def craft(self, rid, times=1, station="hand"):
+        """Craft a recipe `times` times: by hand (C) or at a workbench / furnace standing in the
+        world (E on it). The game's own check (EC) must pass first. Returns how many came out."""
+        rec = next((r for r in await self.p.js("__pkbot.recipes()") if r["id"] == rid), None)
+        if not rec:
+            return 0
+        chk = await self.p.js(f"__pkbot.craftCheck('{rid}', '{station}')")
+        if not chk.get("ok") and "bag is full" in (chk.get("reason") or ""):
+            # make room now (sell / vault / museum), not on the usual 10 minute rhythm
+            self._bag_at = 0.0
+            await self.manage_bag(await self.p.st(), min_free=6)
+            chk = await self.p.js(f"__pkbot.craftCheck('{rid}', '{station}')")
+        if not chk.get("ok"):
+            log.info("craft %s at %s: %s", rid, station, chk.get("reason"))
+            return 0
+        out = rec["out"]["id"]
+        before = await self._count(out)
+        self.act(f"craft {rec['name']} x{times} ({station})")
+        if station == "hand":
+            # Bag > Craft tab (the path jr_craft proved; the craft list buttons are cr-<recipe>)
+            await self.p.b.tap("KeyI")
+            await asyncio.sleep(1.0)
+            await self.p.click_button(fid="tab-craft", wait=0.8)
+        elif not await self.use_station(station):
+            return 0
+        if not await self.p.click_button(fid=f"cr-{rid}", wait=0.5):
+            log.info("craft %s: no button cr-%s (have %s)", rid, rid,
+                     [b["fid"] for b in await self.p.buttons() if b["fid"]][:25])
+        else:
+            for _ in range(times):
+                if not await self.p.click_button(fid="cr-go", wait=0.7):
+                    break
+        await self.p.close_menus()
+        return await self._count(out) - before
+
+    async def chop_tree(self):
+        """Fell the nearest tree outside villages (hitting the bottom log fells all of it, the
+        logs land next to it and fly into the bag)."""
+        before = await self._count("oak_log") + await self._count("birch_log")
+        for t in (await self.p.js("__pkbot.trees(70)"))[:3]:
+            self.act(f"chop tree at {t['x']},{t['z']}")
+            if not await self.p.walk_to(t["x"] + 0.5, t["z"] + 0.5, near=2.2, timeout=120):
+                continue
+            await self.hold_tool("wood")
+            await self.p.break_block(t["x"], t["y"], t["z"])
+            await asyncio.sleep(1.5)
+            await self.p.walk_to(t["x"] + 0.5, t["z"] + 0.5, near=0.9, timeout=15)   # pick the logs up
+            await asyncio.sleep(1.0)
+            if await self._count("oak_log") + await self._count("birch_log") > before:
+                return True
+        return False
+
+    async def mine(self, item, n):
+        """Break natural blocks that drop `item` (sand, stone, iron ore) until the bag has n more."""
+        start = await self._count(item)
+        self._mine_seen = False
+        # never the shovel: next to a dig spot (beaches have them) the game gives the left click
+        # to digging instead of breaking (act.lmbClaimed); a pickaxe breaks sand just as well
+        kind = "rock"
+        rx = self.RAW[item]
+        t_end = time.time() + 200
+        walked = 0
+        while time.time() < t_end:
+            if await self._count(item) - start >= n:
+                break
+            bad = json.dumps([list(k) for k in self._bad_mine])
+            spots = await self.p.js(f"__pkbot.minable(/{rx}/i, 10, {bad})")
+            if not spots:
+                # nothing right here: go once to the densest patch around (8x8 cells)
+                far = json.dumps([list(k) for k in self._bad_rich])
+                rich = await self.p.js(f"__pkbot.richSpot(/{rx}/i, 170, {far})")
+                if not rich or walked >= 2:
+                    break
+                self._mine_seen = True
+                walked += 1
+                self.act(f"go mining {item} at {rich['x']:.0f},{rich['z']:.0f} ({rich['n']} blocks there)")
+                if not await self.p.walk_to(rich["x"], rich["z"], near=3.0, timeout=150):
+                    pos = (await self.p.st())["pos"]
+                    if math.hypot(pos["x"] - rich["x"], pos["z"] - rich["z"]) > 10:
+                        self._bad_rich.add((int(rich["x"]), int(rich["z"])))
+                continue
+            self._mine_seen = True
+            b = spots[0]
+            pos = (await self.p.st())["pos"]
+            close = math.dist((pos["x"], pos["y"] + 1.85, pos["z"]), (b["x"] + 0.5, b["y"] + 0.5, b["z"] + 0.5)) <= 4.5
+            # walk up to it, not onto an exact spot: the block can be hit from a few metres
+            if not close and not await self.p.walk_to(b["x"] + 0.5, b["z"] + 0.5, near=2.5, timeout=25):
+                self._bad_mine.add((b["x"], b["z"]))
+                continue
+            await self.hold_tool(kind)
+            if not await self.p.break_block(b["x"], b["y"], b["z"]):
+                self._bad_mine.add((b["x"], b["z"]))      # could not aim at it from here
+            await asyncio.sleep(1.0)
+        got = await self._count(item) - start
+        if got:
+            self.act(f"mined {got} {item}")
+        return got
+
+    async def obtain(self, item, n, depth=0):
+        """Get n of `item` into the bag. Uses the game's recipe table: craft it (ingredients
+        first, at the station the recipe needs), else chop / mine / pick it up / buy it.
+        Returns True when the bag has n, "step" after making progress, False when an attempt
+        failed, None when there is no way to get it."""
+        have = await self._count(item)
+        if have >= n:
+            return True
+        if depth > 3:
+            return None
+        if item in ("oak_log", "birch_log"):
+            return "step" if await self.chop_tree() else False
+        if item in self.RAW:
+            if await self.mine(item, n - have):
+                return "step"
+            return False if self._mine_seen else None      # none in reach at all: None
+        # a recipe not known yet unlocks when its first ingredient comes into the bag (game OC
+        # table), except the special ones (learned at landmarks / from creatures)
+        recipes = [r for r in await self.p.js(f"__pkbot.recipes('{item}')")
+                   if r["key"] not in self.SPECIAL_KEYS or await self.p.js(f"__pkbot.known('{r['key']}')")]
+        # prefer a recipe whose ingredients are all in the bag already
+        inv = {x["id"]: x["n"] for x in (await self.p.st())["inv"]}
+        recipes.sort(key=lambda r: not all(inv.get(i["id"], 0) >= i["n"] for i in r["in"]))
+        for r in recipes:
+            times = -(-(n - have) // r["out"]["n"])
+            res = True
+            for ing in r["in"]:
+                res = await self.obtain(ing["id"], ing["n"] * times, depth + 1)
+                if res is not True:
+                    break
+            if res is None:
+                continue                      # an ingredient cannot be had: next recipe
+            if res is not True:
+                return res
+            if r["fuel"] and not await self.has_fuel(r["in"], times):
+                res = await self.obtain("blk_planks", inv.get("blk_planks", 0) + 1, depth + 1)
+                if res is not True:
+                    return res
+            chk = await self.p.js(f"__pkbot.craftCheck('{r['id']}', '{r['station']}')")
+            if not chk.get("ok") and "discovered" in (chk.get("reason") or ""):
+                continue
+            made = await self.craft(r["id"], times, r["station"])
+            if await self._count(item) >= n:
+                return True
+            return "step" if made else False
+        if await self.p.js(f"__pkbot.decorFind('{item}', 120).length"):
+            return "step" if await self.p.gather(item, n - have) > 0 else False
+        if await self.p.js(f"__pkbot.shopsSelling('{item}').length"):
+            return "step" if await self.buy_item(item, n - have) else False
+        return None
+
+    async def can_obtain(self, item, n, depth=0):
+        """Dry run of obtain(): is there any way to get n of `item` (bag, chop, mine, recipe
+        tree, ground pickups, shops)? Nothing is done in the game."""
+        if await self._count(item) >= n:
+            return True
+        if depth > 3:
+            return False
+        if item in ("oak_log", "birch_log") or item in self.RAW:
+            return True
+        for r in await self.p.js(f"__pkbot.recipes('{item}')"):
+            if r["key"] in self.SPECIAL_KEYS and not await self.p.js(f"__pkbot.known('{r['key']}')"):
+                continue
+            times = -(-(n - await self._count(item)) // r["out"]["n"])
+            ok = True
+            for ing in r["in"]:
+                if not await self.can_obtain(ing["id"], ing["n"] * times, depth + 1):
+                    ok = False
+                    break
+            if ok:
+                return True
+        if await self.p.js(f"__pkbot.decorFind('{item}', 120).length"):
+            return True
+        return bool(await self.p.js(f"__pkbot.shopsSelling('{item}').length"))
+
+    async def has_fuel(self, ingredients, times):
+        """Furnace fuel the game takes (TC): 1 charcoal, 2 sticks, 1 planks or 1 log, beyond
+        what the recipe itself uses."""
+        inv = {x["id"]: x["n"] for x in (await self.p.st())["inv"]}
+        for ing in ingredients:
+            inv[ing["id"]] = inv.get(ing["id"], 0) - ing["n"] * times
+        return (inv.get("charcoal", 0) >= 1 or inv.get("stick", 0) >= 2 or inv.get("blk_planks", 0) >= 1
+                or inv.get("birch_log", 0) >= 1 or inv.get("oak_log", 0) >= 1)
+
+    # ------------------------------------------------------------------ house
+    LIGHTS = (("blk_window", "glass"), ("blk_lamp", "lamp"), ("blk_lantern", "lantern"), ("blk_crystal", "crystal_lamp"))
+    HOUSE_PLANKS = 44                # 21 wall + 12 roof ring + 9 ceiling + 1 step (+1 spare)
+
+    async def build_house(self, near=None):
+        """House quest, by the game's detector (kw 'house'): a closed room of 3x3 floor and 2 high,
+        20+ walls of own blocks (70%+), own roof (50%+), a door and a light (lamp, lantern or
+        window). Builds a 5x5 plank hut: walls 2 high with a door and a window, a ring on the
+        walls and a ceiling, placed from inside (a step block to reach the wall tops).
+        Returns True when built, "step" after one stage, False on a failed try, None if impossible."""
+        if (await self.p.js("__pkbot.house()")).get("ok"):
+            return True
+        # 1. materials: a light block the game lets us place, 2 door blocks, planks
+        light = None
+        for item, key in self.LIGHTS:
+            if await self._count(item) and await self.p.js(f"__pkbot.known('{key}')"):
+                light = item
+                break
+        if not light:
+            if not await self.can_obtain("blk_window", 1):
+                self.skipped["house"] = "tidak bisa membuat kaca untuk jendela rumah"
+                return None
+            res = await self.obtain("blk_window", 1)
+            if res is not True:
+                if res is None:
+                    self.skipped["house"] = "tidak bisa membuat kaca/lampu untuk rumah"
+                return res
+            light = "blk_window"
+            return "step"
+        if await self._count("blk_door") < 2:
+            res = await self.obtain("blk_door", 2)
+            return "step" if res is True else res
+        need = self.HOUSE_PLANKS
+        started = self._house or (self.store.get("house_site") if self.store else None)
+        if started:
+            # a house already standing in part: only the blocks still missing (+1 step block)
+            x0, z0, y0 = started["x0"], started["z0"], started["y0"]
+            need = 1 + await self.p.js(
+                f"(() => {{ let n = 0; const w = __pk.world; const R = [];"
+                f" for (const i of [1, 2, 3]) R.push([{x0}+i, {z0}], [{x0}+i, {z0}+4], [{x0}, {z0}+i], [{x0}+4, {z0}+i]);"
+                f" for (const [x, z] of R) for (const y of [{y0}, {y0}+1, {y0}+2]) if (!(x === {x0}+2 && z === {z0} && y < {y0}+2) && w.get(x, y, z) === 0) n++;"
+                f" for (const i of [1, 2, 3]) for (const j of [1, 2, 3]) if (w.get({x0}+i, {y0}+2, {z0}+j) === 0) n++;"
+                f" return n; }})()")
+        if await self._count("blk_planks") < need:
+            res = await self.obtain("blk_planks", need)
+            return "step" if res is True else res
+        # 2. site
+        # a site already started survives restarts (settings store)
+        site = self._house or (self.store.get("house_site") if self.store else None)
+        if not site:
+            if near:
+                a = await self.p.js(f"(() => {{ const w = __pk.world; const a = (w.places || []).find(x => x.id === '{near}') || (w.regions || []).find(x => x.id === '{near}'); return a ? [a.x, a.z] : null; }})()")
+                site = await self.p.js(f"__pkbot.houseSite({a[0]}, {a[1]}, 85, 85)") if a else None
+            else:
+                site = await self.p.js("__pkbot.houseSite(null, null, 130)")
+            if not site:
+                self.skipped["house"] = f"tidak ada tanah datar 7x7 di luar desa {('dekat ' + near) if near else 'di sekitar'}"
+                return None
+            if self.store:
+                self.store.set("house_site", site)
+        self._house = site
+        x0, z0, y0 = site["x0"], site["z0"], site["y0"]
+        self.act(f"build a house at {x0},{z0} (floor {y0})")
+        if not await self.p.walk_to(x0 + 2.5, z0 + 2.5, near=0.5, timeout=200):
+            return False
+        return await self._raise_house(x0, z0, y0, light)
+
+    async def _raise_house(self, x0, z0, y0, light):
+        P = "blk_planks"
+        ring = ([(x0 + i, z0) for i in (1, 2, 3)] + [(x0 + i, z0 + 4) for i in (1, 2, 3)] +
+                [(x0, z0 + i) for i in (1, 2, 3)] + [(x0 + 4, z0 + i) for i in (1, 2, 3)])
+        door, window = (x0 + 2, z0), (x0 + 2, z0 + 4)
+        inside = [(x0 + i + 0.5, z0 + j + 0.5) for i in (1, 2, 3) for j in (1, 2, 3)]
+        inside.sort(key=lambda c: (c[0] - x0 - 2.5) ** 2 + (c[1] - z0 - 2.5) ** 2)    # centre first
+
+        async def put(cells, stands):
+            """Place every (x,y,z,item) it can; tries the other standing spots for the rest."""
+            left = list(cells)
+            for st in stands:
+                if not left:
+                    break
+                if st:
+                    await self.p.walk_to(st[0], st[1], near=0.35, timeout=20)
+                for c in list(left):
+                    if await self.p.place_at(*c):
+                        left.remove(c)
+            return left
+
+        async def missing(cells):
+            out = []
+            for c in cells:
+                if await self.p.js(f"__pk.world.get({c[0]},{c[1]},{c[2]})") == 0:
+                    out.append(c)
+            return out
+
+        walls = [(cx, y, cz, light if (y == y0 + 1 and (cx, cz) == window) else P)
+                 for y in (y0, y0 + 1) for (cx, cz) in ring if (cx, cz) != door]
+        # the door goes in last: until then its gap is the way in and out
+        doors = [(door[0], y0, door[1], "blk_door"), (door[0], y0 + 1, door[1], "blk_door")]
+        # the ring on the wall tops only holds the ceiling up (the game's house rule does not
+        # count it); the 9 ceiling blocks are the roof
+        roof = [(cx, y0 + 2, cz, P) for (cx, cz) in ring]
+        ceiling = [(x0 + i, y0 + 2, z0 + j, P) for i in (1, 2, 3) for j in (1, 2, 3)]
+        step = (x0 + 1, y0, z0 + 2)
+        self._house_tries = getattr(self, "_house_tries", 0) + 1
+        if self._house_tries > 8:
+            self._house_tries = 0
+            return False
+
+        # phase 1: walls (one call = one phase, so the 5 minute step watchdog never trips)
+        if await missing(walls):
+            left = await put(walls, [None] + inside)
+            if left:
+                log.info("house walls left: %s", left)
+            return "step"
+
+        # phase 2: ring then ceiling. Wall tops are 2 above the floor and the ray starts 1.85
+        # above the feet, so stand on a step block for the ring; place the whole ring before
+        # any ceiling block (a ceiling block in the way hides the wall tops)
+        if await missing(ceiling):
+            if await missing(roof):
+                if await self.p.js(f"__pk.world.get({step[0]},{step[1]},{step[2]})") == 0:
+                    await self.p.walk_to(x0 + 2.5, z0 + 2.5, near=0.35, timeout=20)
+                    await self.p.place_at(*step, P)
+                await self.p.walk_to(step[0] + 0.5, step[2] + 0.5, near=0.3, timeout=8)
+                if (await self.p.st())["pos"]["y"] < y0 + 0.9:
+                    await self.p.b.key("KeyW", True)
+                    await self.p.b.tap("Space", 0.2)
+                    await asyncio.sleep(0.4)
+                    await self.p.b.key("KeyW", False)
+                    await self.p.walk_to(step[0] + 0.5, step[2] + 0.5, near=0.3, timeout=6)
+                on_step = (await self.p.st())["pos"]["y"] >= y0 + 0.9
+                log.info("house: on the step=%s", on_step)
+                if on_step:
+                    for _ in range(2):
+                        await put(roof, [None])
+                    await put(ceiling, [None])
+            # down again, take the step away, finish the ceiling from the floor
+            await self.p.walk_to(x0 + 2.5, z0 + 2.5, near=0.35, timeout=10)
+            if await self.p.js(f"__pk.world.get({step[0]},{step[1]},{step[2]})") != 0:
+                await self.p.break_block(*step)
+                await asyncio.sleep(0.8)
+            await put(ceiling, [None] + inside)
+            left = await missing(ceiling)
+            if left:
+                log.info("house ceiling left: %s", left)
+                return "step"
+
+        # phase 3: the door, then the game's own check
+        await self.p.walk_to(x0 + 2.5, z0 + 2.5, near=0.35, timeout=10)
+        await put(doors, [None] + inside)
+        h = await self.p.js("__pkbot.house()")
+        self.act(f"house check: {'OK' if h.get('ok') else '; '.join(h.get('missing') or [])}")
+        if h.get("ok"):
+            await asyncio.sleep(6)                          # the quest scanner looks every 5 s
+            await self.say(f"🏠 Rumah selesai dibangun di {x0},{z0}")
+            self._house = None
+            self._house_tries = 0
+            if self.store:
+                self.store.set("house_site", None)
+            await self.leave_house(x0, z0, y0)
+            return True
+        return "step" if await missing(doors) else False
+
+    async def leave_house(self, x0, z0, y0):
+        """Open the door (right click on it) and step out through it (the path planner sees a
+        door as a wall, so walk straight with the keys)."""
+        dx, dz = x0 + 2, z0
+        for _ in range(3):
+            await self.p.walk_to(dx + 0.5, dz + 1.5, near=0.4, timeout=15)
+            is_open = await self.p.js(f"!!(__pk.world.doors.find(d => d.x === {dx} && d.z === {dz} && (d.y === {y0} || d.y === {y0 + 1})) || {{}}).open")
+            if not is_open and await self.p.aim(dx, y0, dz):
+                await self.p.right_click()           # right click on a door opens it
+                await asyncio.sleep(0.6)
+            await self.p.face_xz(dx + 0.5, dz - 3.0)
+            await self.p.b.key("KeyW", True)
+            await asyncio.sleep(1.8)
+            await self.p.b.key("KeyW", False)
+            if (await self.p.st())["pos"]["z"] < z0:
+                return True
+        log.info("house: could not get out through the door")
         return False
 
     async def jr_hunt(self, s, q):
@@ -986,6 +1412,8 @@ class Brain:
                         ok = await self.go_fish(15, want_item=o["item"]) > 0
                     elif await self.p.js(f"__pkbot.decorFind('{o['item']}', 120).length"):
                         ok = await self.p.gather(o["item"], need) > 0
+                    elif await self.p.js(f"__pkbot.shopsSelling('{o['item']}').length"):
+                        ok = await self.buy_item(o["item"], need)
                     else:
                         self.skipped[q["id"]] = f"item '{o['item']}' tidak bisa dipungut di sekitar"
                         self._fail[key] = 99      # look again in 15 minutes, not every loop
@@ -1019,11 +1447,28 @@ class Brain:
                     if res == "wait":
                         continue               # crops still growing: do something else meanwhile
                     ok = res
+                elif kind == "build" and o.get("what") == "farm":
+                    ok = await self.build_field(o.get("near"))
+                elif kind == "build" and o.get("what") == "house":
+                    res = await self.build_house(o.get("near"))
+                    if res is None:
+                        self.skipped[q["id"]] = self.skipped.get("house", "rumah belum bisa dibangun")
+                        self._fail[key] = 99
+                        continue
+                    if res == "step":
+                        return True               # one stage done (materials); more next time
+                    ok = res
+                elif kind == "build":
+                    self.skipped[q["id"]] = f"bangunan '{o.get('what')}' belum didukung"
+                    self._fail[key] = 99
+                    continue
                 elif kind == "place" and o.get("block"):
                     ok = await self.place_specific(o["block"], left)
                     if ok is None:
                         self._fail[key] = 99
                         continue
+                    if ok == "step":
+                        return True
                 elif kind == "place" and not o.get("block"):
                     # any placement counts (game emits "place" for tilled farmland too)
                     ok = await self.till_somewhere(min(left, 12))

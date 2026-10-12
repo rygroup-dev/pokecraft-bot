@@ -523,6 +523,55 @@ class Player:
                 done += 1
         return done
 
+    async def place_at(self, x, y, z, item, reach=6.0):
+        """Place one block of `item` exactly into cell (x,y,z) from where we stand: aim at a face
+        of a solid neighbour that looks towards the cell (the game places at hit + hit normal)
+        and right click. Only faces turned towards the camera ray origin can be hit.
+        Returns True when the cell holds the block."""
+        block = await self.js(f"__pkbot.blockOf('{item}')")
+        if not block:
+            return False
+        if await self.js(f"__pk.world.get({x},{y},{z})") == block:
+            return True
+        if await self.js(f"__pk.world.get({x},{y},{z})") != 0 or await self.js(f"__pkbot.overlaps({x},{y},{z})"):
+            log.info("PLACE %s at %d,%d,%d: cell taken or we stand in it", item, x, y, z)
+            return False
+        if not await self.select_item(item):
+            log.info("PLACE %s: cannot take it in hand", item)
+            return False
+        why = "no solid neighbour"
+        for sup in await self.js(f"__pkbot.supports({x},{y},{z})"):
+            (sx, sy, sz), (dx, dy, dz) = sup["s"], sup["d"]
+            o = (await self.js("__pkbot.ray()"))["o"]
+            # face centre between support and target, nudged a little into the support
+            fx, fy, fz = x + 0.5 - dx * 0.48, y + 0.5 - dy * 0.48, z + 0.5 - dz * 0.48
+            side = (o[0] - fx) * dx + (o[1] - fy) * dy + (o[2] - fz) * dz
+            dist = math.dist(o, (fx, fy, fz))
+            if side < 0.05 or dist > reach:
+                why = f"faces turned away / too far (side {side:.2f}, dist {dist:.1f})"
+                continue
+            for jx, jy in ((0, 0), (0.22, 0.22), (-0.22, -0.22)):
+                # jitter across the face plane (the two axes the face spans)
+                px, py, pz = fx, fy, fz
+                if dx:
+                    py, pz = py + jx, pz + jy
+                elif dy:
+                    px, pz = px + jx, pz + jy
+                else:
+                    px, py = px + jx, py + jy
+                await self.aim_point(px, py, pz, tries=6)
+                h = await self.js("__pkbot.hit()")
+                if not h or (h["x"], h["y"], h["z"]) != (sx, sy, sz) or (h["nx"], h["ny"], h["nz"]) != (dx, dy, dz):
+                    why = f"aim hit {h and (h['x'], h['y'], h['z'], h['nx'], h['ny'], h['nz'])} not {(sx, sy, sz, dx, dy, dz)}"
+                    continue
+                await self.right_click()
+                await asyncio.sleep(0.3)
+                if await self.js(f"__pk.world.get({x},{y},{z})") == block:
+                    return True
+                why = "right click placed nothing"
+        log.info("PLACE %s at %d,%d,%d failed: %s", item, x, y, z, why)
+        return False
+
     async def plant(self, seed, n):
         """Plant up to n seeds on empty farmland around us (hold the seed, right click)."""
         if not await self.select_item(seed):
@@ -640,14 +689,24 @@ class Player:
         return await self.js(f"__pkbot.buttons({'true' if all_layers else 'false'})")
 
     async def click_button(self, fid=None, text=None, wait=0.4):
-        """Click a visible menu button by its data-fid (exact) or label (substring)."""
-        for x in await self.buttons():
-            if (fid and x["fid"] == fid) or (text and text.lower() in x["text"].lower()):
-                if x["off"]:
-                    return False
-                await self.b.click(x["x"], x["y"])
-                await asyncio.sleep(wait)
-                return True
+        """Click a visible menu button by its data-fid (exact) or label (substring). A button
+        scrolled out of its list is wheeled into view first."""
+        for _ in range(6):
+            x = next((x for x in await self.buttons()
+                      if (fid and x["fid"] == fid) or (text and text.lower() in x["text"].lower())), None)
+            if not x:
+                return False
+            if x["off"]:
+                return False
+            if not x.get("vis", True) and x.get("box"):
+                bx = x["box"]
+                await self.b.send("Input.dispatchMouseEvent", {"type": "mouseWheel", "x": bx["x"], "y": bx["y"],
+                                                               "deltaX": 0, "deltaY": bx["dy"]})
+                await asyncio.sleep(0.35)
+                continue
+            await self.b.click(x["x"], x["y"])
+            await asyncio.sleep(wait)
+            return True
         return False
 
     async def close_menus(self, tries=5):

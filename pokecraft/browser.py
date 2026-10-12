@@ -27,7 +27,13 @@ HOOKS = [
     # handle to the game object as soon as the title screen is ready
     # plus the read-only data tables (blocks, species, moves, items, places, shops, recipes, quests)
     ("this.pendingSave=l,", "window.__pk=this,window.__pkx=(()=>{try{return{F,Du,rv,nv,Ag,Kh,ew,kS,aC,o_,jg,sg,z1,_h,tg}}"
-                            "catch(e){return{err:String(e)}}})(),this.pendingSave=l,"),
+                            "catch(e){return{err:String(e)}}})(),"
+                            # the game's own rule functions, each on its own so one missing name
+                            # does not hide the others: NZ requirement check (shop rows), yC
+                            # recipe list, EC can-craft check, dC recipe known, kw build detector
+                            "Object.assign(window.__pkx,(()=>{const o={};try{o.NZ=NZ}catch(e){}try{o.yC=yC}catch(e){}"
+                            "try{o.EC=EC}catch(e){}try{o.dC=dC}catch(e){}try{o.kw=kw}catch(e){}return o})()),"
+                            "this.pendingSave=l,"),
     ("async beginSession(e,t){", "async beginSession(e,t){window.__pk=this;"),
 ]
 KEYS = {  # code -> (key, windowsVirtualKeyCode)
