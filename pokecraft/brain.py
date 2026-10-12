@@ -55,6 +55,7 @@ class Brain:
         self._bag_at = 0.0
         self._heal_fail = 0
         self._heal_pause = 0.0
+        self.requests = []           # (kind, amount, future) from Telegram: done via Wallet page
         self._house = None           # house site being built {x0, z0, y0}
         self._bad_mine = set()       # (x, z) of blocks we could not walk up to
         self._mine_seen = False
@@ -100,6 +101,16 @@ class Brain:
             return
         if s.get("menus") or s.get("busy"):
             await self.p.close_menus()
+            return
+        if self.requests:
+            # owner asked from Telegram (withdraw / deposit while the game owns the save)
+            kind, n, fut = self.requests.pop(0)
+            try:
+                res = await self.wallet_ui(kind, n)
+            except Exception as e:  # noqa: BLE001
+                res = (0, f"gagal: {e}")
+            if not fut.done():
+                fut.set_result(res)
             return
         if s.get("swim") and not await self._water_task(s):
             await self.back_to_land(s)
@@ -155,6 +166,73 @@ class Brain:
             self._heal_fail = 0
         return True
 
+    async def _qty(self):
+        """Number shown in the game's quantity dialog (Withdraw / Deposit how much Gold?)."""
+        txt = await self.p.js("(() => { const l = __pk.menus.layers.filter(x => !x.dead); return l.length ? l[l.length - 1].el.innerText : ''; })()")
+        for line in (txt or "").splitlines():
+            t = line.strip().replace(",", "")
+            if t.isdigit():
+                return int(t)
+        return None
+
+    async def wallet_ui(self, kind, n):
+        """Withdraw (bank -> pouch) or deposit (pouch -> bank) exactly n gold with the game's
+        Wallet page: Bag > Wallet > Withdraw/Deposit Gold > set the amount > confirm.
+        The amount is read back from the dialog and stepped (arrows +-10, More/Less +-1)
+        until it matches. Returns (moved, message)."""
+        n = int(n)
+        s = await self.p.st()
+        before = int(s.get("gems") or 0)
+        self.act(f"{kind} {n} gold via Wallet (owner request)")
+        await self.p.close_menus()
+        await self.p.b.tap("KeyI")
+        await asyncio.sleep(1)
+        if not await self.p.click_button(fid="tab-wallet", wait=1.5):
+            await self.p.close_menus()
+            return 0, "Tab Wallet tidak muncul (sesi online belum siap). Coba lagi sebentar."
+        if not await self.p.click_button(fid=kind, wait=1.0):
+            await self.p.close_menus()
+            return 0, "Tombol tidak aktif (limit harian / saldo kosong)."
+        # game quantity dialog (uV): starts at 1, All = max, ArrowUp/Down +-10,
+        # ArrowRight/Left +-1. Read the max, then start from the nearer end.
+        await self.p.click_button(fid="all", wait=0.4)
+        top = await self._qty()
+        if top is None:
+            await self.p.close_menus()
+            return 0, "Jumlah di dialog tidak terbaca."
+        n = max(1, min(n, top))                       # cannot move more than the game allows
+        if n - 1 < top - n:
+            # nearer to 1: cancel and open the dialog again, it starts at 1
+            await self.p.click_button(fid="cancel", wait=0.6)
+            if not await self.p.click_button(fid=kind, wait=1.0):
+                await self.p.close_menus()
+                return 0, "Dialog tidak bisa dibuka lagi."
+        for _ in range(3):                            # a few rounds in case a key was missed
+            v = await self._qty()
+            if v is None or v == n:
+                break
+            diff = n - v
+            for _ in range(abs(diff) // 10):
+                await self.p.b.tap("ArrowUp" if diff > 0 else "ArrowDown")
+                await asyncio.sleep(0.02)
+            for _ in range(abs(diff) % 10):
+                await self.p.b.tap("ArrowRight" if diff > 0 else "ArrowLeft")
+                await asyncio.sleep(0.02)
+            await asyncio.sleep(0.2)
+        if await self._qty() != n:
+            await self.p.close_menus()
+            return 0, f"Jumlah tidak bisa diatur ke {n}."
+        await self.p.click_button(fid="ok", wait=2.5)
+        await self.p.close_menus()
+        after = int((await self.p.st()).get("gems") or 0)
+        moved = after - before if kind == "withdraw" else before - after
+        if moved > 0:
+            arrow = "bank → kantong" if kind == "withdraw" else "kantong → bank"
+            msg = f"{moved} gold {arrow} (kantong sekarang {after})"
+            await self.say(f"🏦 {'Tarik' if kind == 'withdraw' else 'Deposit'} {msg}")
+            return moved, msg
+        return 0, "Server tidak memindahkan gold (cek limit harian / saldo)."
+
     async def deposit_ui(self, s):
         """Move pouch gold to the bank with the game's own Wallet page (Bag > Wallet >
         Deposit Gold), keeping `keep_pouch` gold for seeds and healing."""
@@ -185,7 +263,7 @@ class Brain:
         after = await self.p.st()
         moved = gems - int(after.get("gems") or 0)
         if ok and moved > 0:
-            await self.say(f"ðŸ¦ Deposit {moved} gold kantong â†’ bank (dari dalam game)")
+            await self.say(f"🏦 Deposit {moved} gold kantong → bank (dari dalam game)")
         else:
             log.info("deposit via wallet did not move gold (ok=%s)", ok)
         return True
@@ -557,7 +635,7 @@ class Brain:
             await self.p.close_menus()
             s2 = await self.p.st()
             if any(q["id"] == o["id"] for q in s2["quests"]):
-                await self.say(f"ðŸ“œ Quest baru: <b>{o['title']}</b> dari {o['name']}")
+                await self.say(f"📜 Quest baru: <b>{o['title']}</b> dari {o['name']}")
             else:
                 self._fail["offer:" + o["id"]] = self._fail.get("offer:" + o["id"], 0) + 1
                 log.info("offer %s not taken (dialogue did not give it)", o["id"])
@@ -724,7 +802,7 @@ class Brain:
             s2 = await self.p.st()
             if not any(x["id"] == q["id"] for x in s2["quests"]):
                 self.stats["quests"] += 1
-                await self.say(f"ðŸ“œ Quest selesai: <b>{q['title']}</b> (gold {s2['gems']})")
+                await self.say(f"📜 Quest selesai: <b>{q['title']}</b> (gold {s2['gems']})")
             else:
                 self._fail[key] = self._fail.get(key, 0) + 1
             return True
@@ -1286,7 +1364,7 @@ class Brain:
         won = any("tuckered out" in l or "fainted" in l and "Wild" in l for l in lines) or after.get("gems", 0) > before.get("gems", 0)
         if any("joined your party" in l or "went to the Box" in l for l in lines):
             self.stats["befriended"] += 1
-            await self.say(f"ðŸ¾ Teman baru bergabung! ({res})")
+            await self.say(f"🐾 Teman baru bergabung! ({res})")
         elif won:
             self.stats["wins"] += 1
         await asyncio.sleep(4.2)       # game duel cooldown is 4 s
@@ -1353,7 +1431,7 @@ class Brain:
             s2 = await self.p.st()
             if s2.get("menus"):            # "new friend" card
                 self.stats["befriended"] += 1
-                await self.say(f"ðŸ¾ {w['species']} jadi teman baru!")
+                await self.say(f"🐾 {w['species']} jadi teman baru!")
                 await self.p.close_menus()
                 return True
         return False
@@ -1504,7 +1582,7 @@ class Brain:
     async def self_heal(self):
         """Nothing changed in the game for minutes: reset input, get free, try another task."""
         log.warning("SELF-HEAL: no progress for %ds (last: %s)", int(time.time() - self._mark_at), self.last_action)
-        await self.say(f"ðŸ›  Bot sempat diam, memperbaiki diri sendiriâ€¦\n<i>{self.last_action[:120]}</i>")
+        await self.say(f"🛠 Bot sempat diam, memperbaiki diri sendiri…\n<i>{self.last_action[:120]}</i>")
         for k in ("KeyW", "KeyA", "KeyS", "KeyD", "ShiftLeft", "KeyG"):
             await self.p.b.key(k, False)
         await self.p.close_menus()

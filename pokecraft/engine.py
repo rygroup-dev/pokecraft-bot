@@ -238,13 +238,32 @@ class Engine:
             await asyncio.sleep(delay)
 
     # ------------------------------------------------------------------ bank
+    async def _via_game(self, kind, amount):
+        """While the game owns the save, the bot in the game does it on the Wallet page
+        (the game's own Withdraw / Deposit Gold buttons)."""
+        brain = getattr(self.game, "brain", None) if self.game else None
+        if not brain or not self.game.running:
+            return 0, "Game belum siap. Coba lagi sebentar."
+        fut = asyncio.get_running_loop().create_future()
+        brain.requests.append((kind, int(amount), fut))
+        try:
+            moved, msg = await asyncio.wait_for(asyncio.shield(fut), 240)
+        except asyncio.TimeoutError:
+            return 0, "⏳ Game sedang sibuk (duel/dialog). Permintaan tetap antre dan dikerjakan sebentar lagi."
+        if moved:
+            await self.refresh()
+            return moved, f"✅ {msg}"
+        return 0, f"❌ {msg}"
+
     async def deposit_pouch(self, amount=None):
         """Move pouch gold (save.gems) into the bank, the same way the game does.
 
         The save is lowered first and only then the deposit is sent, so a failed
         step can never leave the gold counted twice."""
         if self.game_owns_save():
-            return 0, "Bot sedang main game: deposit dilakukan dari menu Wallet di dalam game."
+            if amount is None:
+                return 0, "Bot sedang main game: deposit otomatis dilakukan dari menu Wallet di dalam game."
+            return await self._via_game("deposit", amount)
         async with self._save_lock:
             s = await self.api.get_save()
             save, rev = s.get("save"), s.get("rev")
@@ -277,7 +296,7 @@ class Engine:
 
     async def withdraw_bank(self, amount):
         if self.game_owns_save():
-            return 0, "Bot sedang main game: stop dulu di menu 🎮 Game, baru tarik gold."
+            return await self._via_game("withdraw", amount)
         async with self._save_lock:
             s = await self.api.get_save()
             save, rev = s.get("save"), s.get("rev")
