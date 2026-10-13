@@ -93,6 +93,12 @@ class Browser:
             raise RuntimeError("Edge/Chrome tidak ditemukan")
         self.port = free_port()
         os.makedirs(self.profile_dir, exist_ok=True)
+        no_gpu = sys.platform.startswith("linux") and not os.path.exists("/dev/dri")
+        # software rendering is ~100x slower: ask the game for its lightest graphics (URL params,
+        # the saved settings are not touched)
+        self.query = "?quality=low&noshadow=1&nopost=1&pr=0.35" if no_gpu else ""
+        if no_gpu:
+            self.size = (960, 540)
         args = [exe, f"--remote-debugging-port={self.port}", f"--user-data-dir={self.profile_dir}",
                 f"--window-size={self.size[0]},{self.size[1]}", "--no-first-run",
                 "--no-default-browser-check", "--disable-background-timer-throttling",
@@ -101,10 +107,10 @@ class Browser:
                 "--disable-features=CalculateNativeWinOcclusion,Translate", "about:blank"]
         if sys.platform != "win32" and os.geteuid() == 0:   # Chromium refuses root without these
             args[1:1] = ["--no-sandbox", "--disable-dev-shm-usage"]
+        if self.headless or no_gpu:   # no GPU (VPS): WebGL only works on the software renderer
+            args[1:1] = ["--use-angle=swiftshader", "--enable-unsafe-swiftshader"]
         if self.headless:
             args.insert(1, "--headless=new")
-            args.insert(1, "--use-angle=swiftshader")
-            args.insert(1, "--enable-unsafe-swiftshader")
         self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         url = None
         async with httpx.AsyncClient() as c:
@@ -209,7 +215,7 @@ class Browser:
         await self.send("Fetch.enable", {"patterns": [
             {"urlPattern": SITE + "*", "resourceType": "Document", "requestStage": "Response"}]})
         self.on(self._patch_document)
-        await self.send("Page.navigate", {"url": SITE})
+        await self.send("Page.navigate", {"url": SITE + getattr(self, "query", "")})
 
     async def _patch_document(self, msg):
         if msg.get("method") != "Fetch.requestPaused":
