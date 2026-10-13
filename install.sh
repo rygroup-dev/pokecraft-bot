@@ -149,8 +149,34 @@ main() {
 
   # ------------------------------------------------------------------ 5. jalankan
   echo
-  if command -v chromium >/dev/null 2>&1 || command -v chromium-browser >/dev/null 2>&1 || command -v google-chrome >/dev/null 2>&1 || command -v microsoft-edge >/dev/null 2>&1; then
+  have_browser() { command -v chromium >/dev/null 2>&1 || command -v chromium-browser >/dev/null 2>&1 || command -v google-chrome >/dev/null 2>&1 || command -v microsoft-edge >/dev/null 2>&1; }
+  if ! have_browser && [ "$TERMUX" = 0 ]; then
+    # mode main game butuh Chromium/Chrome. VPS tanpa layar: browser jalan headless otomatis.
+    br="$(ask '  Pasang browser Chromium/Chrome untuk mode main game (sekitar 300 MB)? (Y/n) ')"
+    if [[ ! "$br" =~ ^[nN] ]]; then
+      say "Pasang browser ..."
+      . /etc/os-release 2>/dev/null || true
+      if command -v apt-get >/dev/null 2>&1 && [ "${ID:-}" != "ubuntu" ] && apt-cache show chromium >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y -qq chromium fonts-liberation || warn "Gagal pasang chromium."
+      elif command -v apt-get >/dev/null 2>&1 && [ "$(dpkg --print-architecture)" = "amd64" ]; then
+        # Ubuntu: paket chromium cuma pembungkus snap, jadi pakai Google Chrome (.deb resmi)
+        deb="$(mktemp --suffix=.deb)"
+        if curl -fsSL -o "$deb" https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb; then
+          DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y -qq "$deb" || warn "Gagal pasang Google Chrome."
+        else
+          warn "Gagal download Google Chrome."
+        fi
+        rm -f "$deb"
+      elif command -v dnf >/dev/null 2>&1; then
+        $SUDO dnf install -y -q chromium || warn "Gagal pasang chromium."
+      else
+        warn "Tidak tahu cara pasang browser di sistem ini. Pasang Chromium/Chrome sendiri."
+      fi
+    fi
+  fi
+  if have_browser; then
     ok "Browser ditemukan: mode main game bisa dipakai."
+    [ "$TERMUX" = 0 ] && [ -z "${DISPLAY:-}" ] && echo "  VPS tanpa layar: game jalan headless (tak terlihat) dengan grafik paling ringan, jalannya lebih lambat dari di PC."
   else
     warn "Tidak ada browser Chromium/Chrome: mode main game mati, farming drop + bank + referral tetap jalan."
   fi

@@ -45,6 +45,7 @@ curl -fsSL https://raw.githubusercontent.com/rygroup-dev/pokecraft-bot/main/inst
 ```
 - Paket `git python3 python3-venv tmux nano` dipasang otomatis (pakai `sudo` kalau bukan root).
 - Bot jalan di sesi tmux `poke`. Opsional: auto start saat VPS reboot (systemd service `pokecraft-bot`).
+- Installer menawarkan pasang browser untuk mode main game (Debian/Fedora: Chromium, Ubuntu: Google Chrome). VPS tanpa layar: game jalan **headless** (tak terlihat) dengan grafik paling ringan, karena VPS tidak punya GPU. Jalannya lebih lambat dari di PC, tapi tetap main.
 
 ### 📱 HP Android (Termux + tmux)
 1. Install **Termux** dari [F-Droid](https://f-droid.org/packages/com.termux/) (versi Play Store sudah usang). Opsional: **Termux:Boot** dari F-Droid untuk auto start saat HP menyala.
@@ -106,7 +107,10 @@ tmux new -s poke
 - **Jangan minimize** jendela game (game berhenti). Pakai tombol **🙈 Sembunyikan** di menu 🎮 Game.
 - Berhenti dengan aman: `stop.bat` (Windows) atau `./stop.sh`. Progres disimpan online dulu sebelum browser ditutup.
 - Pause sementara (misalnya mau main sendiri sebentar): buat file `data/pause.flag`, hapus lagi untuk lanjut.
-- Di VPS/HP tanpa layar, matikan mode game di menu 🎮 Game: farming drop, bank, dan referral tetap jalan tanpa browser.
+- **Windows**: Edge/Chrome terlihat di layar (pakai GPU, paling lancar). Tombol **🙈 Sembunyikan** memindahkan jendela ke luar layar supaya PC tetap bisa dipakai.
+- **VPS tanpa layar**: browser jalan headless otomatis. Tanpa GPU, game pakai render software (SwiftShader) + grafik paling ringan (`?quality=low`, tanpa bayangan; setting di save tidak diubah), sekitar 2-5 fps.
+- **VPS dengan desktop (VNC/Xvfb)**: set `DISPLAY` (misal `Environment=DISPLAY=:1` di service) supaya game tampil dan bisa ditonton lewat VNC. Jangan aktifkan 🙈 Sembunyikan di sini.
+- **HP Android (Termux)**: tidak ada Chromium, jadi mode game mati otomatis. Farming drop, bank, dan referral tetap jalan tanpa browser.
 
 ## Catatan
 - Limit harian dari server: 2.000 drop, 3 rare, 3.000 deposit gold.

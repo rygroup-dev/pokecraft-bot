@@ -107,9 +107,12 @@ class Browser:
                 "--disable-features=CalculateNativeWinOcclusion,Translate", "about:blank"]
         if sys.platform != "win32" and os.geteuid() == 0:   # Chromium refuses root without these
             args[1:1] = ["--no-sandbox", "--disable-dev-shm-usage"]
-        if self.headless or no_gpu:   # no GPU (VPS): WebGL only works on the software renderer
+        # Linux server without a screen (plain VPS, no desktop/VNC): run the browser headless
+        headless = self.headless or (sys.platform.startswith("linux") and not os.environ.get("DISPLAY")
+                                     and not os.environ.get("WAYLAND_DISPLAY"))
+        if headless or no_gpu:   # no GPU (VPS): WebGL only works on the software renderer
             args[1:1] = ["--use-angle=swiftshader", "--enable-unsafe-swiftshader"]
-        if self.headless:
+        if headless:
             args.insert(1, "--headless=new")
         self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         url = None
