@@ -1608,17 +1608,17 @@ class Brain:
                 m = self._progress_mark(s)
                 if m != self._mark:
                     self._mark, self._mark_at = m, time.time()
-                elif time.time() - self._mark_at > 240 and s.get("phase") == "play":
+                elif time.time() - self._mark_at > 240 * self.p.slow and s.get("phase") == "play":
                     await self.self_heal()
                     self._mark_at = time.time()
                 t0 = time.time()
-                await asyncio.wait_for(self.step(), 300)   # watchdog: no single step may hang
+                await asyncio.wait_for(self.step(), 300 * self.p.slow)   # watchdog: no single step may hang
                 if time.time() - t0 < 0.4:
                     await asyncio.sleep(1.0)               # a step that did nothing: never spin
             except Paused:
                 log.info("PAUSED (pause.flag)")
             except asyncio.TimeoutError:
-                log.warning("WATCHDOG step took > 5 min (last: %s), resetting", self.last_action)
+                log.warning("WATCHDOG step took > %d min (last: %s), resetting", 5 * self.p.slow, self.last_action)
                 await self.p.hold(["KeyW", "ShiftLeft"], False)
                 await self.p.close_menus()
             except asyncio.CancelledError:

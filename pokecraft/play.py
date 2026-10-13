@@ -119,6 +119,18 @@ class GameRunner:
         self.player = Player(b)
         await self.player.inject()
         self.brain = Brain(self.player, notify=self.e.say, store=self.e.store)
+        await self._measure_speed()
+
+    async def _measure_speed(self):
+        """Game time slows below 10 fps (the game caps a frame at 0.1 s): stretch timeouts to match."""
+        try:
+            fps = float(await asyncio.wait_for(self.browser.fps(), 10))
+        except Exception:  # noqa: BLE001
+            return
+        slow = round(min(6.0, max(1.0, 10.0 / max(fps, 1.0))), 1)
+        if slow != self.player.slow:
+            log.info("game speed: %.0f fps -> timeouts x%.1f", fps, slow)
+        self.player.slow = slow
 
     async def _run(self):
         fails = 0
@@ -133,9 +145,13 @@ class GameRunner:
                 if self.e.store.get("game_hidden"):
                     await self.browser.set_hidden(True)
                 econ_off = 0.0
+                ticks = 0
                 try:
                     while not self._stop.is_set() and not brain_task.done():
                         await asyncio.sleep(15)
+                        ticks += 1
+                        if ticks % 4 == 0:
+                            await self._measure_speed()
                         if not self.browser.alive:
                             raise RuntimeError("browser tertutup")
                         if await self.browser.ensure_not_minimized():

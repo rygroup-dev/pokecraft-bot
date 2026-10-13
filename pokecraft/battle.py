@@ -107,6 +107,19 @@ class Battle:
                 await self.b.tap(key)
                 await asyncio.sleep(0.8)
                 continue
+            party = [m for m in menu if re.search(r"\d+/\d+ \d+$", m["text"] or "")]
+            if party:
+                # "Who will you send out?": each creature ends with "<hp>/<max> <key>". Send the
+                # healthiest one that isn't fainted or already out, by its own key (not by position:
+                # the Back button comes first)
+                ok = [m for m in party if not m["off"] and "Tuckered" not in m["text"]
+                      and "Active" not in m["text"] and _hp("HP " + m["text"].rsplit(" ", 2)[-2])[0]]
+                best = max(ok, key=lambda m: int(re.search(r"(\d+)/\d+ \d+$", m["text"]).group(1)), default=None)
+                key = f"Digit{best['text'].rsplit(' ', 1)[-1]}" if best else "Escape"
+                log.info("BATTLE send out %s -> %s", best["text"] if best else "nobody", key)
+                await self.b.tap(key)
+                await asyncio.sleep(0.8)
+                continue
             # unknown menu (e.g. after-battle choice): take the first enabled option
             i = next((i for i, m in enumerate(menu) if not m["off"]), 0)
             log.info("BATTLE menu %s -> %s", labels, labels[i] if labels else "")

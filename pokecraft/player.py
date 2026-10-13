@@ -32,6 +32,10 @@ class Player:
         self.b = browser
         self.pitch_sign = None     # learned once: how pitch reacts to a vertical drag
         self.pause_file = pause_file
+        # how much slower game time runs than the clock (1 on a normal PC). The game caps a frame at
+        # 0.1 s, so below 10 fps (software rendering on a VPS) walks and timers take longer; set
+        # from the measured fps and used to stretch our timeouts
+        self.slow = 1.0
 
     # ------------------------------------------------------------------ plumbing
     async def inject(self):
@@ -118,7 +122,7 @@ class Player:
         """Walk (and swim) to (x,z) along an A* path. Returns True when within `near`.
         When stuck: jump, back off and sidestep, break a natural block in the way (only if the
         game allows breaking it there), else mark the spot as blocked and plan around it."""
-        t_end = time.time() + timeout
+        t_end = time.time() + timeout * self.slow
         avoid = set()
         replans = 0
         s = await self.st()
@@ -198,7 +202,7 @@ class Player:
                         last_p, last_t = (p["x"], p["z"]), now
                         continue
                     stuck = now - last_t
-                    if stuck < 1.2:
+                    if stuck < 1.2 * self.slow:
                         continue
                     await self.hold(["KeyW", "ShiftLeft"], False)
                     tried += 1
@@ -283,7 +287,7 @@ class Player:
 
     async def break_block(self, x, y, z, timeout=12):
         """Aim at a block and hit it until it is gone."""
-        t_end = time.time() + timeout
+        t_end = time.time() + timeout * self.slow
         while time.time() < t_end:
             gone = await self.js(f"__pk.world.get({x},{y},{z}) === 0")
             if gone:
@@ -359,7 +363,7 @@ class Player:
         fs = await self.js("__pkbot.fishState()")
         if fs["state"] not in ("casting", "waiting"):
             return None
-        t_end = time.time() + timeout
+        t_end = time.time() + timeout * self.slow
         # wait for a real bite
         while time.time() < t_end:
             fs = await self.js("__pkbot.fishState()")
@@ -416,7 +420,7 @@ class Player:
         if not await self.select_item("bug_net"):
             return False
         before = await self.js("__pk.save.stats.bugs")
-        t_end = time.time() + timeout
+        t_end = time.time() + timeout * self.slow
         while time.time() < t_end:
             bugs = await self.js("__pkbot.bugs(50)")
             if not bugs:
@@ -625,7 +629,7 @@ class Player:
     async def gather(self, item, n, radius=70, timeout=240):
         """Pick up n decorations that give `item` (walk next to each, press E when the game
         offers 'Pick up …'). Returns how many were picked."""
-        t_end = time.time() + timeout
+        t_end = time.time() + timeout * self.slow
         got = 0
         skip = set()
         while got < n and time.time() < t_end:
@@ -725,7 +729,7 @@ class Player:
     async def go_to_npc(self, npc_id, timeout=240):
         """Walk next to an NPC (it may wander, so re-read its position) until the game
         focuses it (the 'E Talk to …' prompt)."""
-        t_end = time.time() + timeout
+        t_end = time.time() + timeout * self.slow
         tries = 0
         while time.time() < t_end:
             npcs = await self.js("__pkbot.npcs()")
@@ -751,8 +755,8 @@ class Player:
             if n["d"] > 2.0:
                 # long trips (across the sea) get time in proportion to the distance
                 budget = max(120, n["d"] * 3)
-                t_end = max(t_end, time.time() + budget)
-                if not await self.walk_to(n["x"], n["z"], near=1.8, timeout=min(budget, t_end - time.time())):
+                t_end = max(t_end, time.time() + budget * self.slow)
+                if not await self.walk_to(n["x"], n["z"], near=1.8, timeout=min(budget, (t_end - time.time()) / self.slow)):
                     await asyncio.sleep(0.5)
             else:
                 await self.face_xz(n["x"], n["z"])
@@ -779,7 +783,7 @@ class Player:
 
     async def run_dialogue(self, goals=None, want=None, timeout=90):
         transcript = []
-        t_end = time.time() + timeout
+        t_end = time.time() + timeout * self.slow
         idle = 0
         want = [w.lower() for w in (want or [])]
         used_want = False
